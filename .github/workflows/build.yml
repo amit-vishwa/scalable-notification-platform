@@ -1,0 +1,60 @@
+name: Build and Test
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Java 17 / MySQL 8.4
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    env:
+      # Dummy password for the disposable CI database only.
+      NOTIFICATION_TEST_DB_PASSWORD: ci-only-test-password
+
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: ci-only-root-password
+          MYSQL_DATABASE: notification_platform_test
+          MYSQL_USER: notification_test
+          MYSQL_PASSWORD: ci-only-test-password
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pci-only-root-password --silent"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=12
+          --health-start-period=30s
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Java 17
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Verify whitespace
+        run: git show --format= --check HEAD
+
+      - name: Build and run all tests
+        run: bash ./mvnw --batch-mode --no-transfer-progress clean verify

@@ -1,8 +1,16 @@
+notification:
+  security:
+    api-keys:
+      employee-service: ${NOTIFICATION_EMPLOYEE_API_KEY}
+
 spring:
   application:
     name: scalable-notification-platform
   lifecycle:
     timeout-per-shutdown-phase: 20s
+  jackson:
+    deserialization:
+      fail-on-unknown-properties: true
 
 server:
   shutdown: graceful
