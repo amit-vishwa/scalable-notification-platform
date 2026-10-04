@@ -5,7 +5,10 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.context.ActiveProfiles;
 
 @ActiveProfiles("test")
-@SpringBootTest
+@SpringBootTest(properties = {
+		"notification.worker.enabled=false",
+		"notification.worker.poll-enabled=false"
+})
 class ScalableNotificationPlatformApplicationTests {
 
 	@Test
