@@ -2,6 +2,11 @@ notification:
   security:
     api-keys:
       employee-service: ${NOTIFICATION_EMPLOYEE_API_KEY}
+  worker:
+    enabled: ${NOTIFICATION_WORKER_ENABLED:false}
+    poll-enabled: ${NOTIFICATION_WORKER_POLL_ENABLED:true}
+    batch-size: ${NOTIFICATION_WORKER_BATCH_SIZE:10}
+    poll-delay: ${NOTIFICATION_WORKER_POLL_DELAY:PT5S}
 
 spring:
   application:
@@ -11,6 +16,14 @@ spring:
   jackson:
     deserialization:
       fail-on-unknown-properties: true
+  task:
+    scheduling:
+      pool:
+        size: 1
+      thread-name-prefix: notification-worker-
+      shutdown:
+        await-termination: true
+        await-termination-period: 20s
 
 server:
   shutdown: graceful

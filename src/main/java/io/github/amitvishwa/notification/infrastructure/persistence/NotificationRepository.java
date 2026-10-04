@@ -44,4 +44,23 @@ public interface NotificationRepository
 
             Pageable pageable
     );
+
+    @Query(
+            value = """
+                    SELECT notification.*
+                    FROM notification
+                    WHERE notification.status = 'PENDING'
+                      AND notification.next_attempt_at <= :eligibleAt
+                    ORDER BY notification.next_attempt_at ASC,
+                             notification.created_at_time ASC,
+                             notification.notification_id ASC
+                    LIMIT :batchSize
+                    FOR UPDATE SKIP LOCKED
+                    """,
+            nativeQuery = true
+    )
+    List<Notification> lockPendingBatch(
+            @Param("eligibleAt") Instant eligibleAt,
+            @Param("batchSize") int batchSize
+    );
 }
