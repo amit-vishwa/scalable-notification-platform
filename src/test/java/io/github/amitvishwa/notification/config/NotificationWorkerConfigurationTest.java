@@ -4,6 +4,7 @@ import io.github.amitvishwa.notification.application.port.email.EmailProvider;
 import io.github.amitvishwa.notification.application.processing.NotificationBatchProcessor;
 import io.github.amitvishwa.notification.application.processing.NotificationClaimService;
 import io.github.amitvishwa.notification.application.processing.NotificationOutcomeService;
+import io.github.amitvishwa.notification.application.processing.NotificationRecoveryService;
 import io.github.amitvishwa.notification.infrastructure.email.SimulatedEmailProvider;
 import io.github.amitvishwa.notification.worker.NotificationWorkerScheduler;
 import org.junit.jupiter.api.Test;
@@ -215,6 +216,10 @@ class NotificationWorkerConfigurationTest {
                         "taskScheduler",
                         TaskScheduler.class,
                         NotificationWorkerConfigurationTest::inertScheduler
+                )
+                .withBean(
+                        NotificationRecoveryService.class,
+                        () -> mock(NotificationRecoveryService.class)
                 );
     }
 

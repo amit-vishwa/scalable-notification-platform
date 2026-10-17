@@ -6,13 +6,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.event.ContextClosedEvent;
 import org.springframework.context.event.EventListener;
-import org.springframework.dao.DataAccessException;
-import org.springframework.transaction.TransactionException;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
-import java.util.Objects;
 
 public class NotificationBatchProcessor {
 
@@ -21,6 +18,7 @@ public class NotificationBatchProcessor {
 
     private final NotificationClaimService claimService;
     private final NotificationOutcomeService outcomeService;
+    private final NotificationRecoveryService recoveryService;
     private final EmailProvider emailProvider;
 
     private volatile boolean stopping;
@@ -28,16 +26,13 @@ public class NotificationBatchProcessor {
     public NotificationBatchProcessor(
             NotificationClaimService claimService,
             NotificationOutcomeService outcomeService,
+            NotificationRecoveryService recoveryService,
             EmailProvider emailProvider
     ) {
         this.claimService = claimService;
         this.outcomeService = outcomeService;
+        this.recoveryService = recoveryService;
         this.emailProvider = emailProvider;
-
-        LOGGER.info(
-                "Notification worker initialized; provider={}",
-                emailProvider.getClass().getSimpleName()
-        );
     }
 
     @Transactional(propagation = Propagation.NOT_SUPPORTED)
@@ -46,8 +41,21 @@ public class NotificationBatchProcessor {
             return;
         }
 
+        int recovered = recoveryService.recoverExpired(batchSize);
+
+        if (recovered > 0) {
+            LOGGER.warn(
+                    "Recovered expired processing claims: count={}",
+                    recovered
+            );
+        }
+
+        if (isStopping()) {
+            return;
+        }
+
         List<ClaimedNotification> claims =
-                claimService.claimPending(batchSize);
+                claimService.claimEligible(batchSize);
 
         for (ClaimedNotification claim : claims) {
             if (isStopping()) {
@@ -55,40 +63,90 @@ public class NotificationBatchProcessor {
             }
 
             try {
-                EmailProviderResult result = Objects.requireNonNull(
-                        emailProvider.send(claim.message()),
-                        "Email provider returned no result"
-                );
+                if (!outcomeService.canSend(claim)) {
+                    LOGGER.warn(
+                            "Skipping inactive claim: "
+                                    + "notificationId={}, attemptId={}",
+                            claim.notificationId(),
+                            claim.attemptId()
+                    );
+                    continue;
+                }
 
-                outcomeService.recordOutcome(claim, result);
+                if (isStopping()) {
+                    return;
+                }
 
-                LOGGER.info(
-                        "Notification outcome persisted: "
-                                + "notificationId={}, attemptId={}, outcome={}",
-                        claim.notificationId(),
-                        claim.attemptId(),
-                        result.outcome()
-                );
-            } catch (DataAccessException | TransactionException exception) {
+                EmailProviderResult result = invokeProvider(claim);
+
+                boolean applied =
+                        outcomeService.recordOutcome(claim, result);
+
+                if (applied) {
+                    LOGGER.info(
+                            "Notification outcome persisted: "
+                                    + "notificationId={}, attemptId={}, "
+                                    + "outcome={}",
+                            claim.notificationId(),
+                            claim.attemptId(),
+                            result.outcome()
+                    );
+                } else {
+                    LOGGER.warn(
+                            "Ignoring inactive claim result: "
+                                    + "notificationId={}, attemptId={}, "
+                                    + "outcome={}",
+                            claim.notificationId(),
+                            claim.attemptId(),
+                            result.outcome()
+                    );
+                }
+            } catch (RuntimeException exception) {
                 LOGGER.error(
-                        "Stopping batch after persistence failure: "
-                                + "notificationId={}, attemptId={}, errorType={}",
+                        "Aborting batch after processing-state failure: "
+                                + "notificationId={}, attemptId={}, "
+                                + "errorType={}",
                         claim.notificationId(),
                         claim.attemptId(),
                         exception.getClass().getSimpleName()
                 );
 
                 throw exception;
-            } catch (RuntimeException exception) {
-                LOGGER.error(
-                        "Notification processing failed: "
-                                + "notificationId={}, attemptId={}, errorType={}",
-                        claim.notificationId(),
-                        claim.attemptId(),
-                        exception.getClass().getSimpleName()
-                );
             }
         }
+    }
+
+    private EmailProviderResult invokeProvider(
+            ClaimedNotification claim
+    ) {
+        try {
+            EmailProviderResult result =
+                    emailProvider.send(claim.message());
+
+            if (result != null) {
+                return result;
+            }
+
+            LOGGER.error(
+                    "Provider returned no result: "
+                            + "notificationId={}, attemptId={}",
+                    claim.notificationId(),
+                    claim.attemptId()
+            );
+        } catch (RuntimeException exception) {
+            LOGGER.error(
+                    "Provider outcome is uncertain: "
+                            + "notificationId={}, attemptId={}, "
+                            + "errorType={}",
+                    claim.notificationId(),
+                    claim.attemptId(),
+                    exception.getClass().getSimpleName()
+            );
+        }
+
+        return EmailProviderResult.unknown(
+                ProcessingFailureCodes.OUTCOME_UNKNOWN
+        );
     }
 
     @EventListener(ContextClosedEvent.class)

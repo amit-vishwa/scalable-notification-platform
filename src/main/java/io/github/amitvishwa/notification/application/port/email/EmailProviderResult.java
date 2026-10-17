@@ -81,6 +81,14 @@ public record EmailProviderResult(
         );
     }
 
+    public static EmailProviderResult unknown(String failureCode) {
+        return new EmailProviderResult(
+                DeliveryAttemptOutcome.UNKNOWN,
+                null,
+                failureCode
+        );
+    }
+
     @Override
     public String toString() {
         return "EmailProviderResult[outcome=" + outcome

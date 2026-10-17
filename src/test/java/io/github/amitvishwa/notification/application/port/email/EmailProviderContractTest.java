@@ -152,4 +152,19 @@ class EmailProviderContractTest {
                 notificationId, "recipient@example.com", "Subject", " "
         )).isInstanceOf(IllegalArgumentException.class);
     }
+
+    @Test
+    void representsUnknownOutcomeWithoutInventingProviderAcceptance() {
+        EmailProviderResult result =
+                EmailProviderResult.unknown("DELIVERY_OUTCOME_UNKNOWN");
+
+        assertThat(result.outcome())
+                .isEqualTo(DeliveryAttemptOutcome.UNKNOWN);
+        assertThat(result.failureCode())
+                .isEqualTo("DELIVERY_OUTCOME_UNKNOWN");
+        assertThat(result.providerMessageId()).isNull();
+
+        assertThatThrownBy(() -> EmailProviderResult.unknown(null))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
 }

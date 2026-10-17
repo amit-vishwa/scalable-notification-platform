@@ -4,6 +4,7 @@ import io.github.amitvishwa.notification.application.port.email.EmailProviderRes
 import io.github.amitvishwa.notification.domain.model.DeliveryAttempt;
 import io.github.amitvishwa.notification.domain.model.Notification;
 import io.github.amitvishwa.notification.domain.model.NotificationStatus;
+import io.github.amitvishwa.notification.domain.policy.RetryPolicy;
 import io.github.amitvishwa.notification.infrastructure.persistence.DeliveryAttemptRepository;
 import io.github.amitvishwa.notification.infrastructure.persistence.NotificationRepository;
 import org.springframework.stereotype.Service;
@@ -15,25 +16,27 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Objects;
+import java.util.Optional;
 
 @Service
 public class NotificationOutcomeService {
 
-    private static final String WORKER_PROCESS = "notification-worker";
-    private static final Duration INITIAL_RETRY_DELAY =
-            Duration.ofMinutes(1);
+    private static final String PROCESS = "notification-worker";
 
-    private final NotificationRepository notificationRepository;
-    private final DeliveryAttemptRepository deliveryAttemptRepository;
+    private final NotificationRepository notifications;
+    private final DeliveryAttemptRepository attempts;
+    private final RetryPolicy retryPolicy;
     private final Clock clock;
 
     public NotificationOutcomeService(
-            NotificationRepository notificationRepository,
-            DeliveryAttemptRepository deliveryAttemptRepository,
+            NotificationRepository notifications,
+            DeliveryAttemptRepository attempts,
+            RetryPolicy retryPolicy,
             Clock clock
     ) {
-        this.notificationRepository = notificationRepository;
-        this.deliveryAttemptRepository = deliveryAttemptRepository;
+        this.notifications = notifications;
+        this.attempts = attempts;
+        this.retryPolicy = retryPolicy;
         this.clock = clock;
     }
 
@@ -41,96 +44,174 @@ public class NotificationOutcomeService {
             propagation = Propagation.REQUIRES_NEW,
             isolation = Isolation.READ_COMMITTED
     )
-    public void recordOutcome(
+    public boolean canSend(ClaimedNotification claim) {
+        Objects.requireNonNull(claim, "claim must not be null");
+
+        Notification notification = notifications
+                .lockById(claim.notificationId())
+                .orElse(null);
+
+        if (notification == null) {
+            return false;
+        }
+
+        Optional<DeliveryAttempt> current =
+                currentAttempt(notification, claim);
+
+        if (current.isEmpty()) {
+            return false;
+        }
+
+        Instant now = clock.instant();
+
+        if (!notification.hasActiveLease(now)) {
+            closeUnknown(notification, current.get(), now);
+            return false;
+        }
+
+        return true;
+    }
+
+    @Transactional(
+            propagation = Propagation.REQUIRES_NEW,
+            isolation = Isolation.READ_COMMITTED
+    )
+    public boolean recordOutcome(
             ClaimedNotification claim,
             EmailProviderResult result
     ) {
         Objects.requireNonNull(claim, "claim must not be null");
         Objects.requireNonNull(result, "result must not be null");
 
-        Notification notification = notificationRepository
-                .findById(claim.notificationId())
-                .orElseThrow(() -> new IllegalStateException(
-                        "Claimed notification does not exist"
-                ));
+        Notification notification = notifications
+                .lockById(claim.notificationId())
+                .orElse(null);
 
-        DeliveryAttempt attempt = deliveryAttemptRepository
-                .findById(claim.attemptId())
-                .orElseThrow(() -> new IllegalStateException(
-                        "Claimed delivery attempt does not exist"
-                ));
-
-        if (!attempt.getNotificationId()
-                .equals(notification.getNotificationId())) {
-            throw new IllegalStateException(
-                    "Delivery attempt does not belong to notification"
-            );
+        if (notification == null) {
+            return false;
         }
 
-        if (notification.getStatus() != NotificationStatus.PROCESSING) {
-            throw new IllegalStateException(
-                    "Notification is not processing"
-            );
+        Optional<DeliveryAttempt> current =
+                currentAttempt(notification, claim);
+
+        if (current.isEmpty()) {
+            return false;
         }
 
-        if (attempt.isCompleted()
-                || attempt.getCompletedAtTime() != null) {
-            throw new IllegalStateException(
-                    "Delivery attempt has already been completed"
-            );
-        }
-
+        DeliveryAttempt attempt = current.get();
         Instant now = clock.instant();
+
+        if (!notification.hasActiveLease(now)) {
+            closeUnknown(notification, attempt, now);
+            return false;
+        }
 
         switch (result.outcome()) {
             case ACCEPTED -> {
                 attempt.completeAccepted(
-                        result.providerMessageId(),
-                        WORKER_PROCESS,
-                        now
+                        result.providerMessageId(), PROCESS, now
                 );
-
                 notification.markSent(
-                        result.providerMessageId(),
-                        WORKER_PROCESS,
-                        now
+                        result.providerMessageId(), PROCESS, now
                 );
             }
 
-            case TEMPORARY_FAILURE -> {
-                attempt.completeTemporaryFailure(
-                        result.failureCode(),
-                        WORKER_PROCESS,
-                        now
-                );
-
-                notification.scheduleRetry(
-                        result.failureCode(),
-                        now.plus(INITIAL_RETRY_DELAY),
-                        WORKER_PROCESS,
-                        now
-                );
-            }
+            case TEMPORARY_FAILURE ->
+                    recordTemporaryFailure(
+                            notification, attempt, result, now
+                    );
 
             case PERMANENT_FAILURE -> {
                 attempt.completePermanentFailure(
-                        result.failureCode(),
-                        WORKER_PROCESS,
-                        now
+                        result.failureCode(), PROCESS, now
                 );
-
                 notification.markFailed(
-                        result.failureCode(),
-                        WORKER_PROCESS,
-                        now
+                        result.failureCode(), PROCESS, now
                 );
             }
 
-            default -> throw new IllegalStateException(
-                    "Unsupported provider outcome"
-            );
+            case UNKNOWN -> {
+                attempt.completeUnknown(
+                        result.failureCode(), PROCESS, now
+                );
+                notification.markFailed(
+                        ProcessingFailureCodes.OUTCOME_UNKNOWN,
+                        PROCESS,
+                        now
+                );
+            }
         }
 
-        deliveryAttemptRepository.flush();
+        attempts.flush();
+        return true;
+    }
+
+    private Optional<DeliveryAttempt> currentAttempt(
+            Notification notification,
+            ClaimedNotification claim
+    ) {
+        if (notification.getStatus() != NotificationStatus.PROCESSING) {
+            return Optional.empty();
+        }
+
+        return attempts.findById(claim.attemptId())
+                .filter(attempt ->
+                        attempt.getNotificationId().equals(
+                                notification.getNotificationId()
+                        )
+                                && attempt.getAttemptNumber()
+                                == notification.getLastAttemptNumber()
+                                && !attempt.isCompleted()
+                                && attempt.getCompletedAtTime() == null
+                );
+    }
+
+    private void recordTemporaryFailure(
+            Notification notification,
+            DeliveryAttempt attempt,
+            EmailProviderResult result,
+            Instant now
+    ) {
+        attempt.completeTemporaryFailure(
+                result.failureCode(), PROCESS, now
+        );
+
+        Optional<Duration> delay = retryPolicy.delayAfter(
+                notification.getCycleAttemptCount()
+        );
+
+        if (delay.isPresent()) {
+            notification.scheduleRetry(
+                    result.failureCode(),
+                    now.plus(delay.get()),
+                    PROCESS,
+                    now
+            );
+        } else {
+            notification.markFailed(
+                    ProcessingFailureCodes.RETRY_EXHAUSTED,
+                    PROCESS,
+                    now
+            );
+        }
+    }
+
+    private void closeUnknown(
+            Notification notification,
+            DeliveryAttempt attempt,
+            Instant now
+    ) {
+        attempt.completeUnknown(
+                ProcessingFailureCodes.OUTCOME_UNKNOWN,
+                PROCESS,
+                now
+        );
+        notification.markFailed(
+                ProcessingFailureCodes.OUTCOME_UNKNOWN,
+                PROCESS,
+                now
+        );
+
+        attempts.flush();
     }
 }

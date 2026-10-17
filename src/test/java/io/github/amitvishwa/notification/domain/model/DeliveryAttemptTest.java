@@ -145,6 +145,85 @@ class DeliveryAttemptTest {
         );
     }
 
+    @Test
+    void shouldRecordUnknownOutcomeWithoutAllowingLaterOverwrite() {
+        Instant now = Instant.parse("2026-10-17T09:00:00Z");
+
+        DeliveryAttempt attempt = DeliveryAttempt.start(
+                UUID.randomUUID(),
+                createNotification(now),
+                1,
+                "notification-worker",
+                now
+        );
+
+        attempt.completeUnknown(
+                "DELIVERY_OUTCOME_UNKNOWN",
+                "notification-recovery",
+                now.plusSeconds(300)
+        );
+
+        assertEquals(DeliveryAttemptOutcome.UNKNOWN, attempt.getOutcome());
+        assertEquals("DELIVERY_OUTCOME_UNKNOWN", attempt.getFailureCode());
+        assertNull(attempt.getProviderMessageId());
+        assertTrue(attempt.isCompleted());
+
+        assertThrows(
+                IllegalStateException.class,
+                () -> attempt.completeAccepted(
+                        "late-provider-result",
+                        "notification-worker",
+                        now.plusSeconds(301)
+                )
+        );
+    }
+
+    @Test
+    void shouldLeaveAttemptUnchangedWhenCompletionValidationFails() {
+        Instant now = Instant.parse("2026-10-17T09:00:00Z");
+
+        DeliveryAttempt attempt = DeliveryAttempt.start(
+                UUID.randomUUID(),
+                createNotification(now),
+                1,
+                "notification-worker",
+                now
+        );
+
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> attempt.completeUnknown(
+                        "",
+                        "notification-worker",
+                        now.plusSeconds(1)
+                )
+        );
+
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> attempt.completeAccepted(
+                        "provider-message",
+                        "notification-worker",
+                        now.minusSeconds(1)
+                )
+        );
+
+        assertFalse(attempt.isCompleted());
+        assertNull(attempt.getOutcome());
+        assertNull(attempt.getCompletedAtTime());
+        assertNull(attempt.getFailureCode());
+        assertNull(attempt.getProviderMessageId());
+        assertEquals(now, attempt.getUpdatedAtTime());
+
+        attempt.completeAccepted(
+                "provider-message",
+                "notification-worker",
+                now.plusSeconds(1)
+        );
+
+        assertEquals(DeliveryAttemptOutcome.ACCEPTED, attempt.getOutcome());
+    }
+
     private static Notification createNotification(Instant now) {
         return Notification.create(
                 UUID.randomUUID(),

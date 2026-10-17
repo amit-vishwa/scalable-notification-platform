@@ -1,0 +1,30 @@
+notification:
+  worker:
+    enabled: false
+    poll-enabled: false
+
+spring:
+  main:
+    web-application-type: none
+
+  datasource:
+    url: ${DB_URL}
+    username: ${DB_USERNAME}
+    password: ${DB_PASSWORD}
+
+  flyway:
+    enabled: false
+
+  sql:
+    init:
+      mode: never
+
+  jpa:
+    generate-ddl: false
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC

@@ -6,6 +6,8 @@ import io.github.amitvishwa.notification.application.port.email.EmailProviderRes
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -16,12 +18,11 @@ import java.util.List;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.mockito.Mockito.doThrow;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
-import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
 @ExtendWith(MockitoExtension.class)
@@ -34,6 +35,9 @@ class NotificationBatchProcessorTest {
     private NotificationOutcomeService outcomeService;
 
     @Mock
+    private NotificationRecoveryService recoveryService;
+
+    @Mock
     private EmailProvider emailProvider;
 
     private NotificationBatchProcessor processor;
@@ -43,12 +47,13 @@ class NotificationBatchProcessorTest {
         processor = new NotificationBatchProcessor(
                 claimService,
                 outcomeService,
+                recoveryService,
                 emailProvider
         );
     }
 
     @Test
-    void processesClaimsSequentiallyAndPersistsEachOutcome() {
+    void processesClaimsSequentiallyAfterRecoveryAndLeaseChecks() {
         ClaimedNotification first = claim();
         ClaimedNotification second = claim();
 
@@ -57,123 +62,177 @@ class NotificationBatchProcessorTest {
         EmailProviderResult rejected =
                 EmailProviderResult.permanentFailure("INVALID_RECIPIENT");
 
-        when(claimService.claimPending(2))
-                .thenReturn(List.of(first, second));
+        givenClaims(first, second);
+
+        when(outcomeService.canSend(first)).thenReturn(true);
+        when(outcomeService.canSend(second)).thenReturn(true);
         when(emailProvider.send(first.message())).thenReturn(accepted);
         when(emailProvider.send(second.message())).thenReturn(rejected);
+        when(outcomeService.recordOutcome(first, accepted)).thenReturn(true);
+        when(outcomeService.recordOutcome(second, rejected)).thenReturn(true);
 
         processor.processBatch(2);
 
         InOrder order = inOrder(
+                recoveryService,
                 claimService,
-                emailProvider,
-                outcomeService
+                outcomeService,
+                emailProvider
         );
 
-        order.verify(claimService).claimPending(2);
+        order.verify(recoveryService).recoverExpired(2);
+        order.verify(claimService).claimEligible(2);
+        order.verify(outcomeService).canSend(first);
         order.verify(emailProvider).send(first.message());
         order.verify(outcomeService).recordOutcome(first, accepted);
+        order.verify(outcomeService).canSend(second);
         order.verify(emailProvider).send(second.message());
         order.verify(outcomeService).recordOutcome(second, rejected);
         order.verifyNoMoreInteractions();
     }
 
     @Test
-    void doesNothingWhenNoNotificationsAreEligible() {
-        when(claimService.claimPending(10)).thenReturn(List.of());
+    void doesNotInvokeProviderWhenNoWorkIsEligible() {
+        when(claimService.claimEligible(10)).thenReturn(List.of());
 
         processor.processBatch(10);
 
+        verify(recoveryService).recoverExpired(10);
         verifyNoInteractions(emailProvider, outcomeService);
     }
 
     @Test
-    void continuesAfterUnexpectedProviderFailureWithoutInventingAnOutcome() {
+    void skipsInactiveClaimWithoutSending() {
+        ClaimedNotification claim = claim();
+        givenClaims(claim);
+
+        when(outcomeService.canSend(claim)).thenReturn(false);
+
+        processor.processBatch(1);
+
+        verifyNoInteractions(emailProvider);
+        verify(outcomeService, never()).recordOutcome(any(), any());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void recordsUnknownProviderOutcomeAndContinues(boolean throwsFailure) {
         ClaimedNotification first = claim();
         ClaimedNotification second = claim();
+
+        EmailProviderResult unknown =
+                EmailProviderResult.unknown("DELIVERY_OUTCOME_UNKNOWN");
         EmailProviderResult accepted = EmailProviderResult.accepted(null);
 
-        when(claimService.claimPending(2))
-                .thenReturn(List.of(first, second));
-        when(emailProvider.send(first.message()))
-                .thenThrow(new IllegalStateException("Unexpected failure"));
+        givenClaims(first, second);
+
+        when(outcomeService.canSend(first)).thenReturn(true);
+        when(outcomeService.canSend(second)).thenReturn(true);
+
+        if (throwsFailure) {
+            when(emailProvider.send(first.message()))
+                    .thenThrow(new IllegalStateException(
+                            "Simulated provider failure"
+                    ));
+        } else {
+            when(emailProvider.send(first.message())).thenReturn(null);
+        }
+
         when(emailProvider.send(second.message())).thenReturn(accepted);
+        when(outcomeService.recordOutcome(first, unknown)).thenReturn(true);
+        when(outcomeService.recordOutcome(second, accepted)).thenReturn(true);
 
         processor.processBatch(2);
 
-        verify(emailProvider).send(first.message());
-        verify(emailProvider).send(second.message());
+        verify(outcomeService).recordOutcome(first, unknown);
         verify(outcomeService).recordOutcome(second, accepted);
-        verifyNoMoreInteractions(outcomeService);
+        verify(emailProvider).send(second.message());
     }
 
     @Test
-    void treatsNullProviderResultAsUnexpectedFailureAndContinues() {
-        ClaimedNotification first = claim();
-        ClaimedNotification second = claim();
+    void doesNotResendWhenOutcomeIsIgnored() {
+        ClaimedNotification claim = claim();
         EmailProviderResult accepted = EmailProviderResult.accepted(null);
 
-        when(claimService.claimPending(2))
-                .thenReturn(List.of(first, second));
-        when(emailProvider.send(first.message())).thenReturn(null);
-        when(emailProvider.send(second.message())).thenReturn(accepted);
+        givenClaims(claim);
 
-        processor.processBatch(2);
+        when(outcomeService.canSend(claim)).thenReturn(true);
+        when(emailProvider.send(claim.message())).thenReturn(accepted);
+        when(outcomeService.recordOutcome(claim, accepted)).thenReturn(false);
 
-        verify(outcomeService).recordOutcome(second, accepted);
-        verifyNoMoreInteractions(outcomeService);
+        processor.processBatch(1);
+
+        verify(emailProvider).send(claim.message());
+        verify(outcomeService).recordOutcome(claim, accepted);
     }
 
     @Test
     void abortsBatchAfterDatabaseFailure() {
         assertAbortsAfterPersistenceFailure(
-                new DataIntegrityViolationException(
-                        "Simulated constraint failure"
-                )
+                new DataIntegrityViolationException("Simulated DB failure")
         );
     }
 
     @Test
     void abortsBatchAfterTransactionFailure() {
         assertAbortsAfterPersistenceFailure(
-                new TransactionSystemException(
-                        "Simulated transaction failure"
-                )
+                new TransactionSystemException("Simulated transaction failure")
         );
     }
 
     @Test
-    void doesNotClaimMoreWorkAfterShutdownStarts() {
+    void doesNotClaimWorkWhenRecoveryFails() {
+        RuntimeException failure =
+                new DataIntegrityViolationException(
+                        "Simulated recovery failure"
+                );
+
+        when(recoveryService.recoverExpired(2)).thenThrow(failure);
+
+        assertThatThrownBy(() -> processor.processBatch(2))
+                .isSameAs(failure);
+
+        verifyNoInteractions(
+                claimService,
+                outcomeService,
+                emailProvider
+        );
+    }
+
+    @Test
+    void doesNothingAfterShutdownStarts() {
         processor.stopOnShutdown();
 
         processor.processBatch(10);
 
         verifyNoInteractions(
+                recoveryService,
                 claimService,
-                emailProvider,
-                outcomeService
+                outcomeService,
+                emailProvider
         );
     }
 
     @Test
-    void recordsInFlightOutcomeButStopsBeforeSendingNextNotification() {
+    void recordsInFlightOutcomeButDoesNotSendNextClaimAfterShutdown() {
         ClaimedNotification first = claim();
         ClaimedNotification second = claim();
         EmailProviderResult accepted = EmailProviderResult.accepted(null);
 
-        when(claimService.claimPending(2))
-                .thenReturn(List.of(first, second));
+        givenClaims(first, second);
 
+        when(outcomeService.canSend(first)).thenReturn(true);
         when(emailProvider.send(first.message())).thenAnswer(invocation -> {
             processor.stopOnShutdown();
             return accepted;
         });
+        when(outcomeService.recordOutcome(first, accepted)).thenReturn(true);
 
         processor.processBatch(2);
 
         verify(outcomeService).recordOutcome(first, accepted);
+        verify(outcomeService, never()).canSend(second);
         verify(emailProvider, never()).send(second.message());
-        verifyNoMoreInteractions(outcomeService);
     }
 
     private void assertAbortsAfterPersistenceFailure(
@@ -183,18 +242,27 @@ class NotificationBatchProcessorTest {
         ClaimedNotification second = claim();
         EmailProviderResult accepted = EmailProviderResult.accepted(null);
 
-        when(claimService.claimPending(2))
-                .thenReturn(List.of(first, second));
-        when(emailProvider.send(first.message())).thenReturn(accepted);
+        givenClaims(first, second);
 
-        doThrow(failure)
-                .when(outcomeService)
-                .recordOutcome(first, accepted);
+        when(outcomeService.canSend(first)).thenReturn(true);
+        when(emailProvider.send(first.message())).thenReturn(accepted);
+        when(outcomeService.recordOutcome(first, accepted))
+                .thenThrow(failure);
 
         assertThatThrownBy(() -> processor.processBatch(2))
                 .isSameAs(failure);
 
+        verify(outcomeService, never()).canSend(second);
         verify(emailProvider, never()).send(second.message());
+        verify(outcomeService, never()).recordOutcome(
+                first,
+                EmailProviderResult.unknown("DELIVERY_OUTCOME_UNKNOWN")
+        );
+    }
+
+    private void givenClaims(ClaimedNotification... claims) {
+        when(claimService.claimEligible(claims.length))
+                .thenReturn(List.of(claims));
     }
 
     private ClaimedNotification claim() {

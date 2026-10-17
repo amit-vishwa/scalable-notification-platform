@@ -1,8 +1,10 @@
 package io.github.amitvishwa.notification.application.processing;
 
 import io.github.amitvishwa.notification.application.port.email.EmailMessage;
+import io.github.amitvishwa.notification.config.NotificationRetryProperties;
 import io.github.amitvishwa.notification.domain.model.DeliveryAttempt;
 import io.github.amitvishwa.notification.domain.model.Notification;
+import io.github.amitvishwa.notification.domain.policy.RetryPolicy;
 import io.github.amitvishwa.notification.infrastructure.persistence.DeliveryAttemptRepository;
 import io.github.amitvishwa.notification.infrastructure.persistence.NotificationRepository;
 import org.springframework.stereotype.Service;
@@ -21,20 +23,25 @@ public class NotificationClaimService {
 
     public static final int MAX_BATCH_SIZE = 10;
 
-    private static final int FIRST_ATTEMPT_NUMBER = 1;
-    private static final String WORKER_PROCESS = "notification-worker";
+    private static final String PROCESS = "notification-worker";
 
-    private final NotificationRepository notificationRepository;
-    private final DeliveryAttemptRepository deliveryAttemptRepository;
+    private final NotificationRepository notifications;
+    private final DeliveryAttemptRepository attempts;
+    private final RetryPolicy retryPolicy;
+    private final NotificationRetryProperties retryProperties;
     private final Clock clock;
 
     public NotificationClaimService(
-            NotificationRepository notificationRepository,
-            DeliveryAttemptRepository deliveryAttemptRepository,
+            NotificationRepository notifications,
+            DeliveryAttemptRepository attempts,
+            RetryPolicy retryPolicy,
+            NotificationRetryProperties retryProperties,
             Clock clock
     ) {
-        this.notificationRepository = notificationRepository;
-        this.deliveryAttemptRepository = deliveryAttemptRepository;
+        this.notifications = notifications;
+        this.attempts = attempts;
+        this.retryPolicy = retryPolicy;
+        this.retryProperties = retryProperties;
         this.clock = clock;
     }
 
@@ -42,7 +49,7 @@ public class NotificationClaimService {
             propagation = Propagation.REQUIRES_NEW,
             isolation = Isolation.READ_COMMITTED
     )
-    public List<ClaimedNotification> claimPending(int batchSize) {
+    public List<ClaimedNotification> claimEligible(int batchSize) {
         if (batchSize < 1 || batchSize > MAX_BATCH_SIZE) {
             throw new IllegalArgumentException(
                     "batchSize must be between 1 and " + MAX_BATCH_SIZE
@@ -51,29 +58,39 @@ public class NotificationClaimService {
 
         Instant now = clock.instant();
 
-        List<Notification> notifications =
-                notificationRepository.lockPendingBatch(now, batchSize);
+        List<Notification> eligible =
+                notifications.lockEligibleBatch(now, batchSize);
 
-        if (notifications.isEmpty()) {
-            return List.of();
-        }
+        List<ClaimedNotification> claims =
+                new ArrayList<>(eligible.size());
 
-        List<ClaimedNotification> claimed =
-                new ArrayList<>(notifications.size());
+        for (Notification notification : eligible) {
+            if (notification.getCycleAttemptCount()
+                    >= retryPolicy.maxAttempts()) {
 
-        for (Notification notification : notifications) {
-            notification.markProcessing(WORKER_PROCESS, now);
+                notification.failBeforeProcessing(
+                        ProcessingFailureCodes.RETRY_EXHAUSTED,
+                        PROCESS,
+                        now
+                );
+                continue;
+            }
+
+            int attemptNumber = notification.markProcessing(
+                    PROCESS,
+                    now,
+                    now.plus(retryProperties.processingLease())
+            );
 
             DeliveryAttempt attempt = DeliveryAttempt.start(
                     UUID.randomUUID(),
                     notification,
-                    FIRST_ATTEMPT_NUMBER,
-                    WORKER_PROCESS,
+                    attemptNumber,
+                    PROCESS,
                     now
             );
 
-            DeliveryAttempt savedAttempt =
-                    deliveryAttemptRepository.save(attempt);
+            DeliveryAttempt savedAttempt = attempts.save(attempt);
 
             EmailMessage message = new EmailMessage(
                     notification.getNotificationId(),
@@ -82,16 +99,14 @@ public class NotificationClaimService {
                     notification.getBody()
             );
 
-            claimed.add(
-                    new ClaimedNotification(
-                            savedAttempt.getAttemptId(),
-                            message
-                    )
-            );
+            claims.add(new ClaimedNotification(
+                    savedAttempt.getAttemptId(),
+                    message
+            ));
         }
 
-        deliveryAttemptRepository.flush();
+        attempts.flush();
 
-        return List.copyOf(claimed);
+        return List.copyOf(claims);
     }
 }

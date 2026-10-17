@@ -6,9 +6,7 @@ import org.springframework.test.context.ActiveProfiles;
 import java.time.Instant;
 import java.util.UUID;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertNull;
-import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.*;
 
 @ActiveProfiles("test")
 class NotificationTest {
@@ -41,7 +39,11 @@ class NotificationTest {
 
         Notification notification = createNotification(createdAt);
 
-        notification.markProcessing("notification-worker", processingAt);
+        notification.markProcessing(
+                "notification-worker",
+                processingAt,
+                processingAt.plusSeconds(300)
+        );
         notification.markSent(
                 "provider-message-123",
                 "notification-worker",
@@ -67,7 +69,11 @@ class NotificationTest {
 
         Notification notification = createNotification(createdAt);
 
-        notification.markProcessing("notification-worker", processingAt);
+        notification.markProcessing(
+                "notification-worker",
+                processingAt,
+                processingAt.plusSeconds(300)
+        );
         notification.scheduleRetry(
                 "PROVIDER_TIMEOUT",
                 nextAttemptAt,
@@ -110,7 +116,8 @@ class NotificationTest {
 
         notification.markProcessing(
                 "notification-worker",
-                now.plusSeconds(1)
+                now.plusSeconds(1),
+                now.plusSeconds(301)
         );
 
         assertThrows(
@@ -122,6 +129,201 @@ class NotificationTest {
                         now.plusSeconds(2)
                 )
         );
+    }
+
+    @Test
+    void shouldCountAttemptsOnlyWhenTheyStart() {
+        Instant now = Instant.parse("2026-10-17T09:00:00Z");
+        Notification notification = createNotification(now);
+
+        assertEquals(0, notification.getLastAttemptNumber());
+        assertEquals(0, notification.getCycleAttemptCount());
+
+        int first = notification.markProcessing(
+                "notification-worker",
+                now,
+                now.plusSeconds(300)
+        );
+
+        assertEquals(1, first);
+        assertEquals(1, notification.getLastAttemptNumber());
+        assertEquals(1, notification.getCycleAttemptCount());
+
+        notification.scheduleRetry(
+                "PROVIDER_UNAVAILABLE",
+                now.plusSeconds(60),
+                "notification-worker",
+                now.plusSeconds(1)
+        );
+
+        assertEquals(1, notification.getRetryCount());
+        assertEquals(1, notification.getLastAttemptNumber());
+        assertEquals(1, notification.getCycleAttemptCount());
+        assertNull(notification.getProcessingExpiresAt());
+
+        assertThrows(
+                IllegalStateException.class,
+                () -> notification.markProcessing(
+                        "notification-worker",
+                        now.plusSeconds(59),
+                        now.plusSeconds(359)
+                )
+        );
+
+        assertEquals(1, notification.getLastAttemptNumber());
+        assertEquals(NotificationStatus.RETRY_PENDING, notification.getStatus());
+
+        int second = notification.markProcessing(
+                "notification-worker",
+                now.plusSeconds(60),
+                now.plusSeconds(360)
+        );
+
+        assertEquals(2, second);
+        assertEquals(2, notification.getLastAttemptNumber());
+        assertEquals(2, notification.getCycleAttemptCount());
+
+        assertEquals(REQUEST_HASH, notification.getRequestBodyHash());
+        assertEquals("recipient@example.com", notification.getRecipientEmail());
+        assertEquals("Order received", notification.getSubject());
+        assertEquals("Your order has been received.", notification.getBody());
+    }
+
+    @Test
+    void shouldExpireLeaseAtItsExactBoundary() {
+        Instant now = Instant.parse("2026-10-17T09:00:00Z");
+        Notification notification = createNotification(now);
+
+        notification.markProcessing(
+                "notification-worker",
+                now,
+                now.plusSeconds(300)
+        );
+
+        assertTrue(notification.hasActiveLease(now.plusSeconds(299)));
+        assertFalse(notification.hasActiveLease(now.plusSeconds(300)));
+
+        notification.markFailed(
+                "DELIVERY_OUTCOME_UNKNOWN",
+                "notification-recovery",
+                now.plusSeconds(300)
+        );
+
+        assertEquals(NotificationStatus.FAILED, notification.getStatus());
+        assertNull(notification.getProcessingExpiresAt());
+        assertFalse(notification.hasActiveLease(now.plusSeconds(301)));
+    }
+
+    @Test
+    void shouldRejectInvalidLeaseWithoutChangingState() {
+        Instant now = Instant.parse("2026-10-17T09:00:00Z");
+        Notification notification = createNotification(now);
+
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> notification.markProcessing(
+                        "notification-worker",
+                        now,
+                        now
+                )
+        );
+
+        assertEquals(NotificationStatus.PENDING, notification.getStatus());
+        assertEquals(0, notification.getLastAttemptNumber());
+        assertEquals(0, notification.getCycleAttemptCount());
+        assertNull(notification.getLastAttemptAt());
+        assertNull(notification.getProcessingExpiresAt());
+        assertEquals(now, notification.getUpdatedAtTime());
+    }
+
+    @Test
+    void shouldPreserveLifetimeHistoryWhenManuallyRequeued() {
+        Instant now = Instant.parse("2026-10-17T09:00:00Z");
+        Notification notification = createNotification(now);
+
+        NotificationKey originalKey = notification.getNotificationKey();
+
+        notification.markProcessing(
+                "notification-worker",
+                now,
+                now.plusSeconds(300)
+        );
+
+        notification.scheduleRetry(
+                "PROVIDER_UNAVAILABLE",
+                now.plusSeconds(60),
+                "notification-worker",
+                now.plusSeconds(1)
+        );
+
+        notification.markProcessing(
+                "notification-worker",
+                now.plusSeconds(60),
+                now.plusSeconds(360)
+        );
+
+        notification.markFailed(
+                "DELIVERY_OUTCOME_UNKNOWN",
+                "notification-recovery",
+                now.plusSeconds(61)
+        );
+
+        Instant replayAt = now.plusSeconds(62);
+
+        notification.requeueForManualReplay(
+                "notification-replay-cli",
+                replayAt
+        );
+
+        assertEquals(NotificationStatus.PENDING, notification.getStatus());
+        assertEquals(replayAt, notification.getNextAttemptAt());
+        assertEquals(0, notification.getCycleAttemptCount());
+
+        assertEquals(2, notification.getLastAttemptNumber());
+        assertEquals(1, notification.getRetryCount());
+        assertEquals(now.plusSeconds(60), notification.getLastAttemptAt());
+
+        assertEquals(originalKey, notification.getNotificationKey());
+        assertEquals(REQUEST_HASH, notification.getRequestBodyHash());
+        assertEquals("recipient@example.com", notification.getRecipientEmail());
+        assertEquals("Order received", notification.getSubject());
+        assertEquals("Your order has been received.", notification.getBody());
+
+        assertEquals(now, notification.getCreatedAtTime());
+        assertEquals(PROCESS, notification.getCreatedByProcess());
+        assertEquals(replayAt, notification.getUpdatedAtTime());
+
+        assertNull(notification.getFailureCode());
+        assertNull(notification.getProviderMessageId());
+        assertNull(notification.getProcessingExpiresAt());
+
+        assertEquals(
+                3,
+                notification.markProcessing(
+                        "notification-worker",
+                        replayAt,
+                        replayAt.plusSeconds(300)
+                )
+        );
+        assertEquals(1, notification.getCycleAttemptCount());
+    }
+
+    @Test
+    void shouldRejectReplayUnlessNotificationHasFailed() {
+        Instant now = Instant.parse("2026-10-17T09:00:00Z");
+        Notification notification = createNotification(now);
+
+        assertThrows(
+                IllegalStateException.class,
+                () -> notification.requeueForManualReplay(
+                        "notification-replay-cli",
+                        now.plusSeconds(1)
+                )
+        );
+
+        assertEquals(NotificationStatus.PENDING, notification.getStatus());
+        assertEquals(now, notification.getUpdatedAtTime());
+        assertEquals(0, notification.getLastAttemptNumber());
     }
 
     private static Notification createNotification(Instant now) {

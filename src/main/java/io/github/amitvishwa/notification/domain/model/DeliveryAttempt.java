@@ -142,16 +142,19 @@ public class DeliveryAttempt extends AuditableEntity {
     ) {
         requireIncomplete();
 
-        this.outcome = DeliveryAttemptOutcome.ACCEPTED;
-        this.providerMessageId = requireOptionalText(
+        String validatedId = requireOptionalText(
                 providerMessageId,
                 "providerMessageId",
                 MAX_PROVIDER_MESSAGE_ID_LENGTH
         );
-        this.completedAtTime = requireCompletionTime(now);
-        this.failureCode = null;
+        Instant completedAt = requireCompletionTime(now);
 
         updateAudit(process, now);
+
+        this.outcome = DeliveryAttemptOutcome.ACCEPTED;
+        this.providerMessageId = validatedId;
+        this.completedAtTime = completedAt;
+        this.failureCode = null;
     }
 
     public void completeTemporaryFailure(
@@ -188,19 +191,22 @@ public class DeliveryAttempt extends AuditableEntity {
     ) {
         requireIncomplete();
 
-        this.outcome = Objects.requireNonNull(
-                outcome,
-                "outcome must not be null"
-        );
-        this.failureCode = requireText(
+        DeliveryAttemptOutcome validatedOutcome =
+                Objects.requireNonNull(outcome, "outcome must not be null");
+
+        String validatedCode = requireText(
                 failureCode,
                 "failureCode",
                 MAX_FAILURE_CODE_LENGTH
         );
-        this.completedAtTime = requireCompletionTime(now);
-        this.providerMessageId = null;
+        Instant completedAt = requireCompletionTime(now);
 
         updateAudit(process, now);
+
+        this.outcome = validatedOutcome;
+        this.failureCode = validatedCode;
+        this.completedAtTime = completedAt;
+        this.providerMessageId = null;
     }
 
     private Instant requireCompletionTime(Instant now) {
@@ -257,6 +263,19 @@ public class DeliveryAttempt extends AuditableEntity {
         }
 
         return requireText(value, field, maxLength);
+    }
+
+    public void completeUnknown(
+            String failureCode,
+            String process,
+            Instant now
+    ) {
+        completeFailure(
+                DeliveryAttemptOutcome.UNKNOWN,
+                failureCode,
+                process,
+                now
+        );
     }
 
     public UUID getAttemptId() {
