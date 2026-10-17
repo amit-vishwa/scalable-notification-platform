@@ -1,13 +1,6 @@
 package io.github.amitvishwa.notification.domain.model;
 
-import jakarta.persistence.Column;
-import jakarta.persistence.Entity;
-import jakarta.persistence.EnumType;
-import jakarta.persistence.Enumerated;
-import jakarta.persistence.Id;
-import jakarta.persistence.Index;
-import jakarta.persistence.Table;
-import jakarta.persistence.Version;
+import jakarta.persistence.*;
 import org.hibernate.annotations.JdbcTypeCode;
 import org.hibernate.type.SqlTypes;
 
@@ -119,6 +112,18 @@ public class Notification extends AuditableEntity {
     )
     private Instant lastAttemptAt;
 
+    @Column(name = "last_attempt_number", nullable = false)
+    private int lastAttemptNumber;
+
+    @Column(name = "cycle_attempt_count", nullable = false)
+    private int cycleAttemptCount;
+
+    @Column(
+            name = "processing_expires_at",
+            columnDefinition = "DATETIME(6)"
+    )
+    private Instant processingExpiresAt;
+
     @Column(name = "failure_code", length = MAX_FAILURE_CODE_LENGTH)
     private String failureCode;
 
@@ -207,23 +212,42 @@ public class Notification extends AuditableEntity {
         );
     }
 
-    public void markProcessing(
+    public int markProcessing(
             String process,
-            Instant now
+            Instant now,
+            Instant expiresAt
     ) {
-        if (status != NotificationStatus.PENDING
-                && status != NotificationStatus.RETRY_PENDING) {
-            throw invalidTransition(NotificationStatus.PROCESSING);
+        requireEligibleStatus();
+
+        Objects.requireNonNull(now, "now must not be null");
+        Objects.requireNonNull(expiresAt, "expiresAt must not be null");
+
+        if (nextAttemptAt.isAfter(now)) {
+            throw new IllegalStateException(
+                    "Notification is not yet eligible"
+            );
         }
 
-        status = NotificationStatus.PROCESSING;
-        lastAttemptAt = Objects.requireNonNull(
-                now,
-                "now must not be null"
-        );
-        failureCode = null;
+        if (!expiresAt.isAfter(now)) {
+            throw new IllegalArgumentException(
+                    "expiresAt must be after now"
+            );
+        }
+
+        int nextNumber = Math.incrementExact(lastAttemptNumber);
+        int nextCycleCount = Math.incrementExact(cycleAttemptCount);
 
         updateAudit(process, now);
+
+        status = NotificationStatus.PROCESSING;
+        lastAttemptAt = now;
+        processingExpiresAt = expiresAt;
+        lastAttemptNumber = nextNumber;
+        cycleAttemptCount = nextCycleCount;
+        failureCode = null;
+        providerMessageId = null;
+
+        return nextNumber;
     }
 
     public void markSent(
@@ -233,15 +257,18 @@ public class Notification extends AuditableEntity {
     ) {
         requireStatus(NotificationStatus.PROCESSING);
 
-        this.status = NotificationStatus.SENT;
-        this.providerMessageId = requireOptionalText(
+        String validatedId = requireOptionalText(
                 providerMessageId,
                 "providerMessageId",
                 MAX_PROVIDER_MESSAGE_ID_LENGTH
         );
-        this.failureCode = null;
 
         updateAudit(process, now);
+
+        status = NotificationStatus.SENT;
+        this.providerMessageId = validatedId;
+        failureCode = null;
+        processingExpiresAt = null;
     }
 
     public void scheduleRetry(
@@ -264,16 +291,21 @@ public class Notification extends AuditableEntity {
             );
         }
 
-        this.status = NotificationStatus.RETRY_PENDING;
-        this.retryCount++;
-        this.nextAttemptAt = nextAttemptAt;
-        this.failureCode = requireText(
+        String validatedCode = requireText(
                 failureCode,
                 "failureCode",
                 MAX_FAILURE_CODE_LENGTH
         );
+        int nextRetryCount = Math.incrementExact(retryCount);
 
         updateAudit(process, now);
+
+        status = NotificationStatus.RETRY_PENDING;
+        retryCount = nextRetryCount;
+        this.nextAttemptAt = nextAttemptAt;
+        this.failureCode = validatedCode;
+        providerMessageId = null;
+        processingExpiresAt = null;
     }
 
     public void markFailed(
@@ -283,14 +315,53 @@ public class Notification extends AuditableEntity {
     ) {
         requireStatus(NotificationStatus.PROCESSING);
 
-        this.status = NotificationStatus.FAILED;
-        this.failureCode = requireText(
+        String validatedCode = requireText(
                 failureCode,
                 "failureCode",
                 MAX_FAILURE_CODE_LENGTH
         );
 
         updateAudit(process, now);
+
+        status = NotificationStatus.FAILED;
+        this.failureCode = validatedCode;
+        providerMessageId = null;
+        processingExpiresAt = null;
+    }
+
+    public void failBeforeProcessing(
+            String failureCode,
+            String process,
+            Instant now
+    ) {
+        requireEligibleStatus();
+
+        String validatedCode = requireText(
+                failureCode,
+                "failureCode",
+                MAX_FAILURE_CODE_LENGTH
+        );
+
+        updateAudit(process, now);
+
+        status = NotificationStatus.FAILED;
+        this.failureCode = validatedCode;
+        providerMessageId = null;
+        processingExpiresAt = null;
+    }
+
+    public boolean hasActiveLease(Instant now) {
+        Objects.requireNonNull(now, "now must not be null");
+
+        return processingExpiresAt != null
+                && processingExpiresAt.isAfter(now);
+    }
+
+    private void requireEligibleStatus() {
+        if (status != NotificationStatus.PENDING
+                && status != NotificationStatus.RETRY_PENDING) {
+            throw invalidTransition(NotificationStatus.PROCESSING);
+        }
     }
 
     private void requireStatus(NotificationStatus requiredStatus) {
@@ -364,6 +435,24 @@ public class Notification extends AuditableEntity {
         return requireText(value, field, maxLength);
     }
 
+    public void requeueForManualReplay(
+            String process,
+            Instant now
+    ) {
+        requireStatus(NotificationStatus.FAILED);
+        Objects.requireNonNull(now, "now must not be null");
+
+        updateAudit(process, now);
+
+        status = NotificationStatus.PENDING;
+        nextAttemptAt = now;
+        cycleAttemptCount = 0;
+
+        processingExpiresAt = null;
+        failureCode = null;
+        providerMessageId = null;
+    }
+
     public UUID getNotificationId() {
         return notificationId;
     }
@@ -413,6 +502,18 @@ public class Notification extends AuditableEntity {
 
     public Instant getLastAttemptAt() {
         return lastAttemptAt;
+    }
+
+    public int getLastAttemptNumber() {
+        return lastAttemptNumber;
+    }
+
+    public int getCycleAttemptCount() {
+        return cycleAttemptCount;
+    }
+
+    public Instant getProcessingExpiresAt() {
+        return processingExpiresAt;
     }
 
     public String getFailureCode() {

@@ -4,6 +4,7 @@ import io.github.amitvishwa.notification.application.port.email.EmailMessage;
 import io.github.amitvishwa.notification.application.port.email.EmailProvider;
 import io.github.amitvishwa.notification.application.port.email.EmailProviderResult;
 import io.github.amitvishwa.notification.domain.model.DeliveryAttempt;
+import io.github.amitvishwa.notification.domain.model.DeliveryAttemptOutcome;
 import io.github.amitvishwa.notification.domain.model.Notification;
 import io.github.amitvishwa.notification.domain.model.NotificationKey;
 import io.github.amitvishwa.notification.domain.model.NotificationStatus;
@@ -17,6 +18,7 @@ import org.junit.jupiter.api.parallel.Isolated;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.context.ApplicationContext;
@@ -32,6 +34,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 import java.sql.Timestamp;
 import java.time.Clock;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
@@ -45,9 +48,14 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 @SpringBootTest(properties = {
+        "notification.retry.max-attempts=5",
+        "notification.retry.initial-delay=PT1M",
+        "notification.retry.max-delay=PT15M",
+        "notification.retry.processing-lease=PT5M",
         "notification.worker.enabled=true",
         "notification.worker.poll-enabled=false",
         "spring.datasource.url=jdbc:mysql://localhost:3306/"
@@ -71,6 +79,9 @@ class NotificationWorkerIntegrationTest {
 
     @Autowired
     private NotificationOutcomeService outcomeService;
+
+    @Autowired
+    private NotificationRecoveryService recoveryService;
 
     @Autowired
     private NotificationBatchProcessor processor;
@@ -109,6 +120,11 @@ class NotificationWorkerIntegrationTest {
                 .isZero();
         assertThat(deliveryAttemptRepository.count()).isZero();
 
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM notification_replay",
+                Long.class
+        )).isZero();
+
         sourceApplication = "worker-test-" + UUID.randomUUID();
 
         transactions = new TransactionTemplate(transactionManager);
@@ -143,6 +159,15 @@ class NotificationWorkerIntegrationTest {
 
         transactions.executeWithoutResult(transaction -> {
             jdbcTemplate.update("""
+                    DELETE FROM notification_replay
+                    WHERE notification_id IN (
+                        SELECT notification_id
+                        FROM notification
+                        WHERE source_application = ?
+                    )
+                    """, sourceApplication);
+
+            jdbcTemplate.update("""
                     DELETE FROM delivery_attempt
                     WHERE notification_id IN (
                         SELECT notification_id
@@ -164,7 +189,7 @@ class NotificationWorkerIntegrationTest {
                 pending(1, NOW.minusSeconds(30))
         );
 
-        List<ClaimedNotification> claims = claimService.claimPending(1);
+        List<ClaimedNotification> claims = claimService.claimEligible(1);
 
         assertThat(claims).hasSize(1);
         ClaimedNotification claim = claims.get(0);
@@ -183,6 +208,10 @@ class NotificationWorkerIntegrationTest {
         assertThat(stored.getStatus())
                 .isEqualTo(NotificationStatus.PROCESSING);
         assertThat(stored.getLastAttemptAt()).isEqualTo(NOW);
+        assertThat(stored.getLastAttemptNumber()).isEqualTo(1);
+        assertThat(stored.getCycleAttemptCount()).isEqualTo(1);
+        assertThat(stored.getProcessingExpiresAt())
+                .isEqualTo(NOW.plusSeconds(300));
         assertThat(stored.getUpdatedByProcess())
                 .isEqualTo(WORKER_PROCESS);
         assertThat(stored.getUpdatedAtTime()).isEqualTo(NOW);
@@ -198,82 +227,87 @@ class NotificationWorkerIntegrationTest {
         assertThat(attempt.getCreatedByProcess())
                 .isEqualTo(WORKER_PROCESS);
 
-        assertThat(claimService.claimPending(1)).isEmpty();
+        assertThat(claimService.claimEligible(1)).isEmpty();
         assertThat(deliveryAttemptRepository.count()).isEqualTo(1);
     }
 
     @Test
     void ordersDuePendingNotificationsAndRespectsBatchLimit() {
+        notificationRepository.saveAllAndFlush(List.of(
+                pending(6, NOW.minusSeconds(300)),
+                pending(7, NOW.minusSeconds(300)),
+                pending(8, NOW.minusSeconds(300)),
+                pending(9, NOW.minusSeconds(300))
+        ));
+
+        List<ClaimedNotification> history = claimService.claimEligible(4);
+
+        assertThat(history)
+                .extracting(ClaimedNotification::notificationId)
+                .containsExactly(id(6), id(7), id(8), id(9));
+
+        assertThat(outcomeService.recordOutcome(
+                history.get(0),
+                EmailProviderResult.temporaryFailure("TEMPORARY_ERROR")
+        )).isTrue();
+
+        // Notification 7 remains PROCESSING with a live lease.
+
+        assertThat(outcomeService.recordOutcome(
+                history.get(2),
+                EmailProviderResult.accepted("already-accepted")
+        )).isTrue();
+
+        assertThat(outcomeService.recordOutcome(
+                history.get(3),
+                EmailProviderResult.permanentFailure("INVALID_RECIPIENT")
+        )).isTrue();
+
         Notification earliest = pending(4, NOW.minusSeconds(300));
         Notification olderSameDue = pending(3, NOW.minusSeconds(200));
         Notification firstTie = pending(1, NOW.minusSeconds(100));
         Notification secondTie = pending(2, NOW.minusSeconds(100));
         Notification future = pending(5, NOW.plusSeconds(60));
 
-        Notification retry = pending(6, NOW.minusSeconds(300));
-        retry.markProcessing(TEST_PROCESS, NOW.minusSeconds(290));
-        retry.scheduleRetry(
-                "TEMPORARY_ERROR",
-                NOW.minusSeconds(200),
-                TEST_PROCESS,
-                NOW.minusSeconds(280)
-        );
-
-        Notification processing = pending(7, NOW.minusSeconds(300));
-        processing.markProcessing(TEST_PROCESS, NOW.minusSeconds(100));
-
-        Notification sent = pending(8, NOW.minusSeconds(300));
-        sent.markProcessing(TEST_PROCESS, NOW.minusSeconds(100));
-        sent.markSent(
-                "already-accepted",
-                TEST_PROCESS,
-                NOW.minusSeconds(90)
-        );
-
-        Notification failed = pending(9, NOW.minusSeconds(300));
-        failed.markProcessing(TEST_PROCESS, NOW.minusSeconds(100));
-        failed.markFailed(
-                "INVALID_RECIPIENT",
-                TEST_PROCESS,
-                NOW.minusSeconds(90)
-        );
-
         notificationRepository.saveAllAndFlush(List.of(
                 secondTie,
-                failed,
                 future,
-                retry,
                 olderSameDue,
-                sent,
                 firstTie,
-                processing,
                 earliest
         ));
 
-        // Independently exercise due-time and creation-time ordering.
         setDueTime(earliest, NOW.minusSeconds(100));
         setDueTime(olderSameDue, NOW.minusSeconds(50));
         setDueTime(firstTie, NOW.minusSeconds(50));
         setDueTime(secondTie, NOW.minusSeconds(50));
 
-        assertThat(claimService.claimPending(3))
+        assertThat(claimService.claimEligible(3))
                 .extracting(ClaimedNotification::notificationId)
                 .containsExactly(id(4), id(3), id(1));
 
         assertThat(notification(id(2)).getStatus())
                 .isEqualTo(NotificationStatus.PENDING);
 
-        assertThat(claimService.claimPending(10))
+        assertThat(claimService.claimEligible(10))
                 .extracting(ClaimedNotification::notificationId)
                 .containsExactly(id(2));
 
-        assertThat(claimService.claimPending(10)).isEmpty();
-        assertThat(deliveryAttemptRepository.count()).isEqualTo(4);
+        assertThat(claimService.claimEligible(10)).isEmpty();
+
+        // Four historical claims plus four newly claimed notifications.
+        assertThat(deliveryAttemptRepository.count()).isEqualTo(8);
 
         assertThat(notification(id(5)).getStatus())
                 .isEqualTo(NotificationStatus.PENDING);
         assertThat(notification(id(6)).getStatus())
                 .isEqualTo(NotificationStatus.RETRY_PENDING);
+        assertThat(notification(id(7)).getStatus())
+                .isEqualTo(NotificationStatus.PROCESSING);
+        assertThat(notification(id(8)).getStatus())
+                .isEqualTo(NotificationStatus.SENT);
+        assertThat(notification(id(9)).getStatus())
+                .isEqualTo(NotificationStatus.FAILED);
     }
 
     @Test
@@ -284,7 +318,11 @@ class NotificationWorkerIntegrationTest {
 
         for (int invalidSize : new int[]{-1, 0, 11}) {
             assertThatThrownBy(
-                    () -> claimService.claimPending(invalidSize)
+                    () -> claimService.claimEligible(invalidSize)
+            ).isInstanceOf(IllegalArgumentException.class);
+
+            assertThatThrownBy(
+                    () -> recoveryService.recoverExpired(invalidSize)
             ).isInstanceOf(IllegalArgumentException.class);
         }
 
@@ -307,12 +345,12 @@ class NotificationWorkerIntegrationTest {
 
         Future<?> holder = concurrentTasks.submit(() ->
                 transactions.executeWithoutResult(transaction -> {
-                    List<Notification> held =
-                            notificationRepository.lockPendingBatch(NOW, 1);
+                    Notification held = notificationRepository
+                            .lockById(id(1))
+                            .orElseThrow();
 
-                    assertThat(held)
-                            .extracting(Notification::getNotificationId)
-                            .containsExactly(id(1));
+                    assertThat(held.getNotificationId())
+                            .isEqualTo(id(1));
 
                     locked.countDown();
                     awaitRelease(release);
@@ -326,7 +364,7 @@ class NotificationWorkerIntegrationTest {
 
             Future<List<ClaimedNotification>> claimant =
                     concurrentTasks.submit(
-                            () -> claimService.claimPending(2)
+                            () -> claimService.claimEligible(2)
                     );
 
             assertThat(claimant.get(10, TimeUnit.SECONDS))
@@ -341,11 +379,11 @@ class NotificationWorkerIntegrationTest {
 
         holder.get(10, TimeUnit.SECONDS);
 
-        assertThat(claimService.claimPending(2))
+        assertThat(claimService.claimEligible(2))
                 .extracting(ClaimedNotification::notificationId)
                 .containsExactly(id(1));
 
-        assertThat(claimService.claimPending(2)).isEmpty();
+        assertThat(claimService.claimEligible(2)).isEmpty();
         assertThat(deliveryAttemptRepository.count()).isEqualTo(2);
     }
 
@@ -369,7 +407,7 @@ class NotificationWorkerIntegrationTest {
                         )
                 );
 
-        assertThatThrownBy(() -> claimService.claimPending(2))
+        assertThatThrownBy(() -> claimService.claimEligible(2))
                 .isInstanceOf(DataIntegrityViolationException.class);
 
         for (Notification original : saved) {
@@ -383,6 +421,9 @@ class NotificationWorkerIntegrationTest {
                     .isEqualTo(original.getVersion());
             assertThat(stored.getUpdatedByProcess())
                     .isEqualTo(TEST_PROCESS);
+            assertThat(stored.getLastAttemptNumber()).isZero();
+            assertThat(stored.getCycleAttemptCount()).isZero();
+            assertThat(stored.getProcessingExpiresAt()).isNull();
         }
 
         assertThat(deliveryAttemptRepository.count()).isEqualTo(1);
@@ -400,54 +441,88 @@ class NotificationWorkerIntegrationTest {
                 pending(1, NOW.minusSeconds(30))
         );
 
-        ClaimedNotification claim = claimService.claimPending(1).get(0);
+        ClaimedNotification claim = claimService.claimEligible(1).get(0);
 
-        outcomeService.recordOutcome(claim, result);
+        assertThat(outcomeService.recordOutcome(claim, result)).isTrue();
 
         Notification stored = notification(claim.notificationId());
-        DeliveryAttempt attempt = attempt(claim.attemptId());
+        DeliveryAttempt completedAttempt = attempt(claim.attemptId());
 
         assertThat(stored.getStatus()).isEqualTo(expectedStatus);
         assertThat(stored.getRetryCount()).isEqualTo(expectedRetryCount);
         assertThat(stored.getFailureCode()).isEqualTo(result.failureCode());
         assertThat(stored.getProviderMessageId())
                 .isEqualTo(result.providerMessageId());
-        assertThat(stored.getUpdatedByProcess())
-                .isEqualTo(WORKER_PROCESS);
+        assertThat(stored.getProcessingExpiresAt()).isNull();
+        assertThat(stored.getLastAttemptNumber()).isEqualTo(1);
+        assertThat(stored.getCycleAttemptCount()).isEqualTo(1);
+        assertThat(stored.getUpdatedByProcess()).isEqualTo(WORKER_PROCESS);
         assertThat(stored.getUpdatedAtTime()).isEqualTo(NOW);
 
-        assertThat(attempt.getOutcome()).isEqualTo(result.outcome());
-        assertThat(attempt.getCompletedAtTime()).isEqualTo(NOW);
-        assertThat(attempt.getFailureCode()).isEqualTo(result.failureCode());
-        assertThat(attempt.getProviderMessageId())
+        assertThat(completedAttempt.getOutcome()).isEqualTo(result.outcome());
+        assertThat(completedAttempt.getCompletedAtTime()).isEqualTo(NOW);
+        assertThat(completedAttempt.getFailureCode())
+                .isEqualTo(result.failureCode());
+        assertThat(completedAttempt.getProviderMessageId())
                 .isEqualTo(result.providerMessageId());
-        assertThat(attempt.getUpdatedByProcess())
+        assertThat(completedAttempt.getUpdatedByProcess())
                 .isEqualTo(WORKER_PROCESS);
+
+        long completedVersion = stored.getVersion();
+
+        assertThat(outcomeService.recordOutcome(claim, result)).isFalse();
+        assertThat(notification(claim.notificationId()).getVersion())
+                .isEqualTo(completedVersion);
 
         if (expectedStatus == NotificationStatus.RETRY_PENDING) {
             assertThat(stored.getNextAttemptAt())
                     .isEqualTo(NOW.plusSeconds(60));
 
-            when(clock.instant()).thenReturn(NOW.plusSeconds(61));
+            when(clock.instant()).thenReturn(NOW.plusSeconds(59));
+            assertThat(claimService.claimEligible(10)).isEmpty();
 
-            // P007 records retry intent; P008 will consume RETRY_PENDING.
-            assertThat(claimService.claimPending(10)).isEmpty();
+            when(clock.instant()).thenReturn(NOW.plusSeconds(60));
+
+            List<ClaimedNotification> retry = claimService.claimEligible(1);
+            assertThat(retry).hasSize(1);
+
+            assertThat(attempt(retry.get(0).attemptId()).getAttemptNumber())
+                    .isEqualTo(2);
+            assertThat(notification(claim.notificationId()).getCycleAttemptCount())
+                    .isEqualTo(2);
+
+            // The original result must not overwrite the newer attempt.
+            assertThat(outcomeService.recordOutcome(
+                    claim,
+                    EmailProviderResult.accepted("late-original-result")
+            )).isFalse();
+
+            assertThat(notification(claim.notificationId()).getStatus())
+                    .isEqualTo(NotificationStatus.PROCESSING);
+            assertThat(attempt(retry.get(0).attemptId()).isCompleted()).isFalse();
+
+            DeliveryAttempt originalAttempt = attempt(claim.attemptId());
+
+            assertThat(originalAttempt.getOutcome())
+                    .isEqualTo(DeliveryAttemptOutcome.TEMPORARY_FAILURE);
+            assertThat(originalAttempt.getCompletedAtTime()).isEqualTo(NOW);
+            assertThat(originalAttempt.getFailureCode())
+                    .isEqualTo(result.failureCode());
+            assertThat(originalAttempt.getProviderMessageId()).isNull();
+
+            assertThat(deliveryAttemptRepository.count()).isEqualTo(2);
+        } else {
+            assertThat(deliveryAttemptRepository.count()).isEqualTo(1);
         }
-
-        assertThatThrownBy(
-                () -> outcomeService.recordOutcome(claim, result)
-        ).isInstanceOf(IllegalStateException.class);
-
-        assertThat(deliveryAttemptRepository.count()).isEqualTo(1);
     }
 
     @Test
-    void rollsBackPartialOutcomeMutationWhenCompletionValidationFails() {
+    void rejectsInvalidCompletionWithoutPersistingChanges() {
         notificationRepository.saveAndFlush(
                 pending(1, NOW.minusSeconds(30))
         );
 
-        ClaimedNotification claim = claimService.claimPending(1).get(0);
+        ClaimedNotification claim = claimService.claimEligible(1).get(0);
 
         // Completion cannot precede the recorded attempt start.
         when(clock.instant()).thenReturn(NOW.minusSeconds(1));
@@ -519,6 +594,443 @@ class NotificationWorkerIntegrationTest {
         assertThat(deliveryAttemptRepository.count()).isEqualTo(1);
     }
 
+    @Test
+    void exhaustsAfterFiveTotalAttemptsWithoutResending() {
+        notificationRepository.saveAndFlush(
+                pending(1, NOW.minusSeconds(30))
+        );
+
+        List<UUID> attemptIds = new ArrayList<>();
+        Instant attemptAt = NOW;
+
+        for (int number = 1; number <= 5; number++) {
+            when(clock.instant()).thenReturn(attemptAt);
+
+            List<ClaimedNotification> claims =
+                    claimService.claimEligible(1);
+
+            assertThat(claims).hasSize(1);
+
+            ClaimedNotification claim = claims.get(0);
+            attemptIds.add(claim.attemptId());
+
+            assertThat(attempt(claim.attemptId()).getAttemptNumber())
+                    .isEqualTo(number);
+
+            assertThat(outcomeService.recordOutcome(
+                    claim,
+                    EmailProviderResult.temporaryFailure(
+                            "PROVIDER_UNAVAILABLE"
+                    )
+            )).isTrue();
+
+            Notification stored = notification(id(1));
+
+            assertThat(stored.getLastAttemptNumber()).isEqualTo(number);
+            assertThat(stored.getCycleAttemptCount()).isEqualTo(number);
+            assertThat(stored.getProcessingExpiresAt()).isNull();
+
+            if (number < 5) {
+                long delaySeconds = 60L << (number - 1);
+                Instant dueAt = attemptAt.plusSeconds(delaySeconds);
+
+                assertThat(stored.getStatus())
+                        .isEqualTo(NotificationStatus.RETRY_PENDING);
+                assertThat(stored.getRetryCount()).isEqualTo(number);
+                assertThat(stored.getNextAttemptAt()).isEqualTo(dueAt);
+
+                when(clock.instant()).thenReturn(dueAt.minusSeconds(1));
+                assertThat(claimService.claimEligible(1)).isEmpty();
+
+                attemptAt = dueAt;
+            } else {
+                assertThat(stored.getStatus())
+                        .isEqualTo(NotificationStatus.FAILED);
+                assertThat(stored.getFailureCode())
+                        .isEqualTo(ProcessingFailureCodes.RETRY_EXHAUSTED);
+                assertThat(stored.getRetryCount()).isEqualTo(4);
+            }
+        }
+
+        for (UUID attemptId : attemptIds) {
+            DeliveryAttempt completed = attempt(attemptId);
+
+            assertThat(completed.getOutcome())
+                    .isEqualTo(DeliveryAttemptOutcome.TEMPORARY_FAILURE);
+            assertThat(completed.getFailureCode())
+                    .isEqualTo("PROVIDER_UNAVAILABLE");
+            assertThat(completed.getCompletedAtTime()).isNotNull();
+        }
+
+        long failedVersion = notification(id(1)).getVersion();
+
+        when(clock.instant()).thenReturn(attemptAt.plusSeconds(86_400));
+        processor.processBatch(1);
+
+        verifyNoInteractions(emailProvider);
+
+        assertThat(deliveryAttemptRepository.count()).isEqualTo(5);
+        assertThat(notification(id(1)).getVersion())
+                .isEqualTo(failedVersion);
+    }
+
+    @Test
+    void ordersDueRetriesTogetherWithPendingWork() {
+        Notification first = pending(1, NOW.minusSeconds(300));
+        Notification future = pending(2, NOW.minusSeconds(300));
+        Notification laterCreated = pending(3, NOW.minusSeconds(200));
+
+        notificationRepository.saveAllAndFlush(
+                List.of(first, future, laterCreated)
+        );
+
+        ClaimedNotification original =
+                claimService.claimEligible(1).get(0);
+
+        assertThat(original.notificationId()).isEqualTo(id(1));
+
+        assertThat(outcomeService.recordOutcome(
+                original,
+                EmailProviderResult.temporaryFailure("PROVIDER_UNAVAILABLE")
+        )).isTrue();
+
+        setDueTime(future, NOW.plusSeconds(61));
+        setDueTime(laterCreated, NOW.plusSeconds(60));
+
+        when(clock.instant()).thenReturn(NOW.plusSeconds(60));
+
+        List<ClaimedNotification> due = claimService.claimEligible(2);
+
+        assertThat(due)
+                .extracting(ClaimedNotification::notificationId)
+                .containsExactly(id(1), id(3));
+
+        assertThat(attempt(due.get(0).attemptId()).getAttemptNumber())
+                .isEqualTo(2);
+        assertThat(attempt(due.get(1).attemptId()).getAttemptNumber())
+                .isEqualTo(1);
+
+        assertThat(claimService.claimEligible(10)).isEmpty();
+
+        when(clock.instant()).thenReturn(NOW.plusSeconds(61));
+
+        assertThat(claimService.claimEligible(1))
+                .extracting(ClaimedNotification::notificationId)
+                .containsExactly(id(2));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void quarantinesAtTheExactLeaseBoundary(boolean checkBeforeSending) {
+        notificationRepository.saveAndFlush(
+                pending(1, NOW.minusSeconds(30))
+        );
+
+        ClaimedNotification claim =
+                claimService.claimEligible(1).get(0);
+
+        when(clock.instant()).thenReturn(NOW.plusSeconds(299));
+        assertThat(outcomeService.canSend(claim)).isTrue();
+
+        long processingVersion =
+                notification(claim.notificationId()).getVersion();
+
+        Instant expiredAt = NOW.plusSeconds(300);
+        when(clock.instant()).thenReturn(expiredAt);
+
+        if (checkBeforeSending) {
+            assertThat(outcomeService.canSend(claim)).isFalse();
+        } else {
+            assertThat(outcomeService.recordOutcome(
+                    claim,
+                    EmailProviderResult.accepted("late-provider-result")
+            )).isFalse();
+        }
+
+        Notification failed = assertQuarantined(
+                claim,
+                WORKER_PROCESS,
+                expiredAt
+        );
+
+        assertThat(failed.getVersion()).isEqualTo(processingVersion + 1);
+
+        long failedVersion = failed.getVersion();
+
+        assertThat(outcomeService.recordOutcome(
+                claim,
+                EmailProviderResult.accepted("another-late-result")
+        )).isFalse();
+
+        assertThat(recoveryService.recoverExpired(10)).isZero();
+        assertThat(claimService.claimEligible(10)).isEmpty();
+
+        assertThat(notification(claim.notificationId()).getVersion())
+                .isEqualTo(failedVersion);
+
+        verifyNoInteractions(emailProvider);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void recoversOnlyExpiredWorkIncludingLegacyRows(boolean legacyLease) {
+        notificationRepository.saveAndFlush(
+                pending(1, NOW.minusSeconds(30))
+        );
+
+        ClaimedNotification claim =
+                claimService.claimEligible(1).get(0);
+
+        if (legacyLease) {
+            // Simulate a historical PROCESSING row without a stored lease.
+            int updated = jdbcTemplate.update("""
+                UPDATE notification
+                SET processing_expires_at = NULL
+                WHERE source_application = ?
+                  AND idempotency_key = ?
+                """, sourceApplication, "key-1");
+
+            assertThat(updated).isEqualTo(1);
+        }
+
+        long processingVersion =
+                notification(claim.notificationId()).getVersion();
+
+        when(clock.instant()).thenReturn(NOW.plusSeconds(299));
+
+        assertThat(recoveryService.recoverExpired(10)).isZero();
+        assertThat(notification(claim.notificationId()).getStatus())
+                .isEqualTo(NotificationStatus.PROCESSING);
+
+        Instant expiredAt = NOW.plusSeconds(300);
+        when(clock.instant()).thenReturn(expiredAt);
+
+        assertThat(recoveryService.recoverExpired(10)).isEqualTo(1);
+
+        Notification failed = assertQuarantined(
+                claim,
+                "notification-recovery",
+                expiredAt
+        );
+
+        assertThat(failed.getVersion()).isEqualTo(processingVersion + 1);
+
+        long failedVersion = failed.getVersion();
+
+        assertThat(recoveryService.recoverExpired(10)).isZero();
+
+        assertThat(outcomeService.recordOutcome(
+                claim,
+                EmailProviderResult.accepted("late-provider-result")
+        )).isFalse();
+
+        assertThat(claimService.claimEligible(10)).isEmpty();
+        assertThat(notification(claim.notificationId()).getVersion())
+                .isEqualTo(failedVersion);
+
+        verifyNoInteractions(emailProvider);
+    }
+
+    @Test
+    void quarantinesMissingHistoryWithoutCreatingAnAttempt() {
+        notificationRepository.saveAndFlush(
+                pending(1, NOW.minusSeconds(600))
+        );
+
+        // Deliberately inconsistent historical fixture, not application behavior.
+        int updated = jdbcTemplate.update("""
+            UPDATE notification
+            SET status = 'PROCESSING',
+                processing_expires_at = NULL,
+                last_attempt_at = NULL
+            WHERE source_application = ?
+              AND idempotency_key = ?
+            """, sourceApplication, "key-1");
+
+        assertThat(updated).isEqualTo(1);
+
+        assertThat(recoveryService.recoverExpired(1)).isEqualTo(1);
+
+        Notification stored = notification(id(1));
+
+        assertThat(stored.getStatus())
+                .isEqualTo(NotificationStatus.FAILED);
+        assertThat(stored.getFailureCode())
+                .isEqualTo(ProcessingFailureCodes.HISTORY_MISSING);
+        assertThat(stored.getProcessingExpiresAt()).isNull();
+        assertThat(stored.getLastAttemptNumber()).isZero();
+        assertThat(stored.getCycleAttemptCount()).isZero();
+
+        assertThat(deliveryAttemptRepository.count()).isZero();
+        assertThat(recoveryService.recoverExpired(1)).isZero();
+        assertThat(claimService.claimEligible(1)).isEmpty();
+    }
+
+    @Test
+    void rollsBackRecoveryBatchWhenALaterAttemptIsInvalid() {
+        notificationRepository.saveAllAndFlush(List.of(
+                pending(1, NOW.minusSeconds(60)),
+                pending(2, NOW.minusSeconds(30))
+        ));
+
+        List<ClaimedNotification> claims = claimService.claimEligible(2);
+
+        assertThat(claims)
+                .extracting(ClaimedNotification::notificationId)
+                .containsExactly(id(1), id(2));
+
+        List<Notification> before = claims.stream()
+                .map(claim -> notification(claim.notificationId()))
+                .toList();
+
+        // Fault injection: the second attempt cannot complete at NOW + 300.
+        int updated = jdbcTemplate.update("""
+            UPDATE delivery_attempt AS attempt
+            JOIN notification AS notification_record
+              ON notification_record.notification_id =
+                 attempt.notification_id
+            SET attempt.started_at_time = ?
+            WHERE notification_record.source_application = ?
+              AND notification_record.idempotency_key = ?
+              AND attempt.attempt_number = 1
+            """,
+                Timestamp.from(NOW.plusSeconds(301)),
+                sourceApplication,
+                "key-2"
+        );
+
+        assertThat(updated).isEqualTo(1);
+
+        when(clock.instant()).thenReturn(NOW.plusSeconds(300));
+
+        assertThatThrownBy(() -> recoveryService.recoverExpired(2))
+                .isInstanceOf(IllegalArgumentException.class);
+
+        for (int index = 0; index < claims.size(); index++) {
+            ClaimedNotification claim = claims.get(index);
+            Notification original = before.get(index);
+            Notification stored = notification(claim.notificationId());
+
+            assertThat(stored.getStatus())
+                    .isEqualTo(NotificationStatus.PROCESSING);
+            assertThat(stored.getVersion()).isEqualTo(original.getVersion());
+            assertThat(stored.getProcessingExpiresAt())
+                    .isEqualTo(original.getProcessingExpiresAt());
+            assertThat(stored.getUpdatedAtTime())
+                    .isEqualTo(original.getUpdatedAtTime());
+            assertThat(stored.getUpdatedByProcess())
+                    .isEqualTo(original.getUpdatedByProcess());
+            assertThat(stored.getLastAttemptNumber()).isEqualTo(1);
+            assertThat(stored.getCycleAttemptCount()).isEqualTo(1);
+
+            DeliveryAttempt storedAttempt = attempt(claim.attemptId());
+
+            assertThat(storedAttempt.getOutcome()).isNull();
+            assertThat(storedAttempt.getCompletedAtTime()).isNull();
+            assertThat(storedAttempt.getFailureCode()).isNull();
+        }
+    }
+
+    @Test
+    void rollsBackOutcomeWhenRetryCounterOverflows() {
+        notificationRepository.saveAndFlush(
+                pending(1, NOW.minusSeconds(30))
+        );
+
+        ClaimedNotification claim =
+                claimService.claimEligible(1).get(0);
+
+        int updated = jdbcTemplate.update("""
+            UPDATE notification
+            SET retry_count = ?
+            WHERE source_application = ?
+              AND idempotency_key = ?
+            """, Integer.MAX_VALUE, sourceApplication, "key-1");
+
+        assertThat(updated).isEqualTo(1);
+
+        Notification before = notification(claim.notificationId());
+
+        assertThatThrownBy(() -> outcomeService.recordOutcome(
+                claim,
+                EmailProviderResult.temporaryFailure("PROVIDER_UNAVAILABLE")
+        )).isInstanceOf(ArithmeticException.class);
+
+        Notification stored = notification(claim.notificationId());
+
+        assertThat(stored.getStatus())
+                .isEqualTo(NotificationStatus.PROCESSING);
+        assertThat(stored.getVersion()).isEqualTo(before.getVersion());
+        assertThat(stored.getRetryCount()).isEqualTo(Integer.MAX_VALUE);
+        assertThat(stored.getProcessingExpiresAt())
+                .isEqualTo(before.getProcessingExpiresAt());
+        assertThat(stored.getUpdatedAtTime())
+                .isEqualTo(before.getUpdatedAtTime());
+
+        DeliveryAttempt storedAttempt = attempt(claim.attemptId());
+
+        assertThat(storedAttempt.getOutcome()).isNull();
+        assertThat(storedAttempt.getCompletedAtTime()).isNull();
+        assertThat(storedAttempt.getFailureCode()).isNull();
+    }
+
+    @Test
+    void serializesRecoveryAgainstALateOutcome() throws Exception {
+        notificationRepository.saveAndFlush(
+                pending(1, NOW.minusSeconds(30))
+        );
+
+        ClaimedNotification claim =
+                claimService.claimEligible(1).get(0);
+
+        long processingVersion =
+                notification(claim.notificationId()).getVersion();
+
+        Instant expiredAt = NOW.plusSeconds(300);
+        when(clock.instant()).thenReturn(expiredAt);
+
+        CountDownLatch start = new CountDownLatch(1);
+        concurrentTasks = Executors.newFixedThreadPool(2);
+
+        Future<Integer> recovery = concurrentTasks.submit(() -> {
+            awaitRelease(start);
+            return recoveryService.recoverExpired(1);
+        });
+
+        Future<Boolean> lateOutcome = concurrentTasks.submit(() -> {
+            awaitRelease(start);
+            return outcomeService.recordOutcome(
+                    claim,
+                    EmailProviderResult.accepted("late-provider-result")
+            );
+        });
+
+        start.countDown();
+
+        // Recovery may skip the row while the outcome transaction holds its lock.
+        assertThat(recovery.get(10, TimeUnit.SECONDS)).isIn(0, 1);
+        assertThat(lateOutcome.get(10, TimeUnit.SECONDS)).isFalse();
+
+        Notification stored = notification(claim.notificationId());
+
+        assertThat(stored.getStatus())
+                .isEqualTo(NotificationStatus.FAILED);
+        assertThat(stored.getFailureCode())
+                .isEqualTo(ProcessingFailureCodes.OUTCOME_UNKNOWN);
+        assertThat(stored.getVersion()).isEqualTo(processingVersion + 1);
+
+        DeliveryAttempt completed = attempt(claim.attemptId());
+
+        assertThat(completed.getOutcome())
+                .isEqualTo(DeliveryAttemptOutcome.UNKNOWN);
+        assertThat(completed.getCompletedAtTime()).isEqualTo(expiredAt);
+        assertThat(completed.getProviderMessageId()).isNull();
+
+        assertThat(recoveryService.recoverExpired(1)).isZero();
+        assertThat(claimService.claimEligible(1)).isEmpty();
+        assertThat(deliveryAttemptRepository.count()).isEqualTo(1);
+    }
+
     private static Stream<Arguments> providerOutcomes() {
         return Stream.of(
                 Arguments.of(
@@ -537,6 +1049,11 @@ class NotificationWorkerIntegrationTest {
                         EmailProviderResult.permanentFailure(
                                 "INVALID_RECIPIENT"
                         ),
+                        NotificationStatus.FAILED,
+                        0
+                ),
+                Arguments.of(
+                        EmailProviderResult.unknown("DELIVERY_OUTCOME_UNKNOWN"),
                         NotificationStatus.FAILED,
                         0
                 )
@@ -582,6 +1099,40 @@ class NotificationWorkerIntegrationTest {
     private DeliveryAttempt attempt(UUID attemptId) {
         return deliveryAttemptRepository.findById(attemptId)
                 .orElseThrow();
+    }
+
+    private Notification assertQuarantined(
+            ClaimedNotification claim,
+            String expectedProcess,
+            Instant completedAt
+    ) {
+        Notification stored = notification(claim.notificationId());
+
+        assertThat(stored.getStatus())
+                .isEqualTo(NotificationStatus.FAILED);
+        assertThat(stored.getFailureCode())
+                .isEqualTo(ProcessingFailureCodes.OUTCOME_UNKNOWN);
+        assertThat(stored.getProcessingExpiresAt()).isNull();
+        assertThat(stored.getProviderMessageId()).isNull();
+        assertThat(stored.getLastAttemptNumber()).isEqualTo(1);
+        assertThat(stored.getCycleAttemptCount()).isEqualTo(1);
+        assertThat(stored.getRetryCount()).isZero();
+        assertThat(stored.getUpdatedByProcess()).isEqualTo(expectedProcess);
+        assertThat(stored.getUpdatedAtTime()).isEqualTo(completedAt);
+
+        DeliveryAttempt completed = attempt(claim.attemptId());
+
+        assertThat(completed.getOutcome())
+                .isEqualTo(DeliveryAttemptOutcome.UNKNOWN);
+        assertThat(completed.getFailureCode())
+                .isEqualTo(ProcessingFailureCodes.OUTCOME_UNKNOWN);
+        assertThat(completed.getCompletedAtTime()).isEqualTo(completedAt);
+        assertThat(completed.getUpdatedByProcess()).isEqualTo(expectedProcess);
+        assertThat(completed.getProviderMessageId()).isNull();
+
+        assertThat(deliveryAttemptRepository.count()).isEqualTo(1);
+
+        return stored;
     }
 
     private void assertTestDatabase() {

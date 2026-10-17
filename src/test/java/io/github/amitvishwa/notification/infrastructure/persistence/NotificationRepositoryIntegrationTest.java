@@ -116,7 +116,8 @@ class NotificationRepositoryIntegrationTest {
         );
         olderButScheduledLater.markProcessing(
                 PROCESS,
-                baseTime.plusSeconds(1)
+                baseTime.plusSeconds(1),
+                baseTime.plusSeconds(301)
         );
         olderButScheduledLater.scheduleRetry(
                 "TEMPORARY_ERROR",
@@ -154,6 +155,23 @@ class NotificationRepositoryIntegrationTest {
                         sameTimeFirstId
                 )
         );
+
+        DeliveryAttempt previousAttempt = DeliveryAttempt.start(
+                UUID.randomUUID(),
+                olderButScheduledLater,
+                1,
+                PROCESS,
+                baseTime.plusSeconds(1)
+        );
+
+        previousAttempt.completeTemporaryFailure(
+                "TEMPORARY_ERROR",
+                PROCESS,
+                baseTime.plusSeconds(2)
+        );
+
+        deliveryAttemptRepository.saveAndFlush(previousAttempt);
+
         entityManager.clear();
 
         List<Notification> eligible =

@@ -1,70 +1,69 @@
 # Scalable Notification Platform
 
-A production-oriented, server-to-server notification backend with
-durable, asynchronous processing.
+A production-oriented, server-to-server notification backend with durable,
+asynchronous processing.
 
-The project is under development and is not yet production-ready.
-The current provider simulates acceptance without sending emails.
+The project is under development and is **not yet production-ready**.
+The current provider simulates acceptance without sending email.
 
-## Current implementation — P007
+## Current implementation — P008
 
 Implemented:
 
 - API-key authentication with application-scoped ownership
 - Request validation before persistence
-- Durable notification submission to MySQL
+- Durable submission to MySQL before returning a new-request acceptance
 - Application-scoped idempotency and request fingerprinting
-- Notification status lookup with masked recipient information
+- Status lookup with masked recipient information
 - Safe API error responses and correlation IDs
 - Flyway-managed database migrations
-- Durable background claims and delivery-attempt audit records
-- Sequential processing through an internal EmailProvider interface
-- A non-sending simulated provider restricted to local/test profiles
-- Unit, configuration, and real-MySQL integration tests
+- Durable background claims and delivery-attempt history
+- Sequential processing through an internal `EmailProvider` interface
+- Scheduled retries with capped exponential backoff and attempt exhaustion
+- Processing leases and conservative interrupted-work recovery
+- Audited, opt-in operator replay through a non-web command-line mode
+- A non-sending simulator restricted to eligible local/test configurations
+- Unit, configuration, real-MySQL integration, and explicit upgrade-rehearsal tests
 
-Not implemented yet:
+Still to implement or verify:
 
-- Real email-provider adapters
-- Retry execution, backoff, and retry exhaustion
-- Recovery of interrupted or uncertain processing
-- Production deployment and operational hardening
+- Real email-provider adapters, bounded network timeouts, and delivery feedback
+- Production authorization, secrets, deployment, observability, and hardening
+- Representative query-plan, lock-contention, and multi-worker throughput testing
+- Separate worker deployment, Redis, Kafka, and Kubernetes
 
-The worker is disabled by default. Submission stores a notification as
-`PENDING`. Enabling the local simulated worker can advance it to `SENT`
-without sending any email.
+The default operating scope remains one deployment with one sequential
+scheduled worker. The worker is disabled by default. New submissions stay
+`PENDING` until processing is enabled.
 
-`SENT` currently represents simulated provider acceptance, not an email
-sent or delivered to an inbox.
+`SENT` means provider acceptance, not confirmed mailbox delivery.
+With the current simulator it means simulated acceptance only.
 
 ## Technology and architecture
 
 - Java 17
 - Spring Boot 4.1.1
 - Maven Wrapper
-- MySQL
-- Spring Data JPA
-- Flyway
+- Native MySQL locally; MySQL 8.4 in the CI service
+- Spring Data JPA and Flyway
 - JUnit, Mockito, and AssertJ
 
-The application is a single Maven module and deployable modular monolith.
+The application is one Maven module and a deployable modular monolith.
 
-Base package:
+Base package: `io.github.amitvishwa.notification`
 
-```text
-io.github.amitvishwa.notification
-```
-
-Package responsibilities:
-
-- `api`: HTTP controllers, DTOs, authentication, and API errors
-- `application`: submission, query, idempotency, provider ports, and processing use cases
-- `domain`: notification models and lifecycle rules
-- `infrastructure`: persistence and provider implementations
-- `config`: application configuration
-- `worker`: scheduling of background polling
+| Package | Responsibility |
+| --- | --- |
+| `api` | HTTP controllers, DTOs, authentication, and API errors |
+| `application` | Submission, queries, idempotency, provider ports, processing, and replay use cases |
+| `domain` | Notification models, lifecycle rules, and retry policy |
+| `infrastructure` | Persistence and provider implementations |
+| `config` | Application configuration and startup safety gates |
+| `worker` | Scheduled background polling |
+| `operator.replay` | Explicit operator CLI argument parsing and execution |
 
 MySQL is the durable source of truth and the current work queue.
-In-memory collections are not used as the primary notification store.
+In-memory collections are not the primary notification store.
 
 ## Prerequisites
 
@@ -73,138 +72,193 @@ In-memory collections are not used as the primary notification store.
 - Native MySQL Server
 - An editor or IDE
 
-Use the repository's Maven Wrapper for reproducible builds.
-A separate Maven installation is not required.
+Use the repository's Maven Wrapper; a separate Maven installation is not
+required. Local verification has used MySQL 9.7. CI is configured for
+MySQL 8.4. Docker Desktop is not required for local development/testing.
 
-Local verification has been performed with MySQL 9.7.1.
-CI is configured to verify the application against MySQL 8.4.
+## Local database setup
 
-Docker Desktop is not required for local development or local testing.
-The CI workflow uses its own disposable MySQL service.
+Keep development and automated-test databases/accounts separate:
 
-## Database setup
+| Purpose | Database | Account |
+| --- | --- | --- |
+| Development | `notification_platform` | `notification_user@localhost` |
+| Automated tests | `notification_platform_test` | `notification_test@localhost` |
+| Explicit upgrade rehearsal only | `notification_platform_upgrade_test` | `notification_upgrade_test@localhost` |
 
-Use separate databases and credentials for development and testing.
-Never run automated tests against a production database.
+Never run tests or demonstrations against production data.
 
-For a new local installation, execute the following as a MySQL
-administrator. Replace both password placeholders before execution.
+If development/test databases already exist, use the approved existing
+setup. Do not rerun account creation, change grants, or clear existing data
+without reviewing their current use.
+
+For a genuinely new local setup, connect as a MySQL administrator. First
+check the exact names; if any exist, stop this fresh-setup sequence.
+
+```sql
+SELECT SCHEMA_NAME
+FROM information_schema.SCHEMATA
+WHERE SCHEMA_NAME IN ('notification_platform', 'notification_platform_test');
+
+SELECT User, Host
+FROM mysql.user
+WHERE User IN ('notification_user', 'notification_test');
+```
+
+Only when both results are empty, run each following statement separately,
+stopping on errors:
 
 ```sql
 CREATE DATABASE notification_platform
-    CHARACTER SET utf8mb4
-    COLLATE utf8mb4_0900_ai_ci;
+    CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
 
 CREATE DATABASE notification_platform_test
-    CHARACTER SET utf8mb4
-    COLLATE utf8mb4_0900_ai_ci;
+    CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
 
-CREATE USER 'notification_user'@'localhost'
-    IDENTIFIED BY 'REPLACE_WITH_YOUR_DEVELOPMENT_PASSWORD';
+CREATE USER 'notification_user'@'localhost' IDENTIFIED BY RANDOM PASSWORD;
 
-CREATE USER 'notification_test'@'localhost'
-    IDENTIFIED BY 'REPLACE_WITH_YOUR_TEST_PASSWORD';
+CREATE USER 'notification_test'@'localhost' IDENTIFIED BY RANDOM PASSWORD;
+```
 
-GRANT ALL PRIVILEGES ON notification_platform.*
+Each account-creation result contains its generated password. Store it
+privately; do not share the result or save credentials in the repository.
+
+Grant these exact table privileges; Flyway will create the tables:
+
+```sql
+GRANT ALL PRIVILEGES ON
+    `notification_platform`.`notification`
+    TO 'notification_user'@'localhost';
+GRANT ALL PRIVILEGES ON
+    `notification_platform`.`delivery_attempt`
+    TO 'notification_user'@'localhost';
+GRANT ALL PRIVILEGES ON
+    `notification_platform`.`notification_replay`
+    TO 'notification_user'@'localhost';
+GRANT ALL PRIVILEGES ON
+    `notification_platform`.`flyway_schema_history`
     TO 'notification_user'@'localhost';
 
-GRANT ALL PRIVILEGES ON notification_platform_test.*
+GRANT ALL PRIVILEGES ON
+    `notification_platform_test`.`notification`
+    TO 'notification_test'@'localhost';
+GRANT ALL PRIVILEGES ON
+    `notification_platform_test`.`delivery_attempt`
+    TO 'notification_test'@'localhost';
+GRANT ALL PRIVILEGES ON
+    `notification_platform_test`.`notification_replay`
+    TO 'notification_test'@'localhost';
+GRANT ALL PRIVILEGES ON
+    `notification_platform_test`.`flyway_schema_history`
     TO 'notification_test'@'localhost';
 ```
 
-If these databases and users already exist, reuse them instead of
-rerunning the creation statements.
+Verify each account with `SHOW GRANTS`. These are local migration/test
+privileges, not a production runtime privilege design. Production must
+separate migration, application runtime, and operator access.
 
-These database-scoped grants support local development and Flyway
-migrations. Before production deployment, separate migration privileges
-from least-privilege application runtime access.
+Exact-table grants avoid schema-name wildcard ambiguity and must be
+reviewed when future migrations add tables. MySQL permits grants before
+table creation when CREATE is included. See [MySQL GRANT](https://dev.mysql.com/doc/refman/9.7/en/grant.html).
 
-Flyway manages the schema. Do not manually create application tables
-or edit migrations that have already been applied.
+Flyway owns schema changes. Do not manually create application tables or
+edit migrations already applied to a database.
 
 ## Build and test
 
-The complete test suite requires:
+The standard suite requires:
 
 - Native MySQL running
-- The dedicated `notification_platform_test` database
-- The `NOTIFICATION_TEST_DB_PASSWORD` environment variable
-- Empty `notification` and `delivery_attempt` tables before worker tests
-- No other application using the test database during execution
+- `notification_platform_test` and its dedicated account
+- `NOTIFICATION_TEST_DB_PASSWORD` in the current terminal
+- Empty `notification`, `delivery_attempt`, and `notification_replay` tables
+- No running application/worker or other test using that database
 
-Flyway's schema-history table can remain populated.
-
-Worker integration tests refuse to clear pre-existing application records.
-Their cleanup removes only fixtures created by the current test.
+The Flyway schema-history table can remain populated. Queue/replay
+integration tests refuse pre-existing application records and clean only
+their own fixtures.
 
 ### Git Bash
 
-Clear worker overrides and enter the test password without displaying it:
+Run password-entry commands one at a time, entering the password when
+prompted. Input characters are intentionally hidden.
 
 ```bash
 unset NOTIFICATION_WORKER_ENABLED NOTIFICATION_WORKER_POLL_ENABLED
 unset NOTIFICATION_WORKER_BATCH_SIZE NOTIFICATION_WORKER_POLL_DELAY
+unset NOTIFICATION_UPGRADE_REHEARSAL NOTIFICATION_UPGRADE_DB_PASSWORD
 
-read -r -s -p "Test database password: " NOTIFICATION_TEST_DB_PASSWORD
+set +x
+IFS= read -r -s -p "Test database password: " NOTIFICATION_TEST_DB_PASSWORD
 printf '\n'
 export NOTIFICATION_TEST_DB_PASSWORD
 
 ./mvnw clean verify
 ```
 
-Environment variables set this way apply only to the current terminal
-session. Set them again after opening a new session.
+Clear any additional custom retry/worker overrides before expecting
+default-configuration test results. Use a dedicated, reviewed test shell;
+unrelated datasource/JVM overrides must not redirect application tests.
+
+Environment variables entered in a terminal are session-specific. A
+separate or newly opened terminal does not inherit later changes.
 
 ### Windows PowerShell
 
-After securely setting `NOTIFICATION_TEST_DB_PASSWORD` in the current
-terminal, clear worker overrides and run:
+After securely setting `NOTIFICATION_TEST_DB_PASSWORD` for the current
+terminal and clearing custom configuration overrides:
 
 ```powershell
 Remove-Item -LiteralPath `
     "Env:NOTIFICATION_WORKER_ENABLED", `
     "Env:NOTIFICATION_WORKER_POLL_ENABLED", `
     "Env:NOTIFICATION_WORKER_BATCH_SIZE", `
-    "Env:NOTIFICATION_WORKER_POLL_DELAY" `
+    "Env:NOTIFICATION_WORKER_POLL_DELAY", `
+    "Env:NOTIFICATION_UPGRADE_REHEARSAL", `
+    "Env:NOTIFICATION_UPGRADE_DB_PASSWORD" `
     -ErrorAction SilentlyContinue
 
 .\mvnw.cmd clean verify
 ```
 
-The test profile supplies dummy application API keys. Do not replace
-them with production credentials.
+The test profile supplies dummy API keys; do not replace them with real
+credentials. Negative tests can log expected database constraint failures
+or refused application contexts. The final summary must have zero
+unexpected failures/errors.
 
-The build runs the tests and packages the executable application JAR.
+### Explicit populated-schema upgrade rehearsal
 
-Expected constraint violations and rejected application contexts may
-appear in negative-test logs. The final test summary must still report
-zero failures and errors.
+`NotificationMigrationUpgradeRehearsal` is deliberately outside Surefire's
+default test-name patterns and additionally requires an environment opt-in.
+It is not part of the normal CI suite and uses a separate, freshly created
+database/account.
 
-### Test coverage
+Follow [the upgrade rehearsal guide](docs/upgrade-rehearsal.md). It applies
+V1/V2, inserts synthetic historical data, applies V3/V4, validates all old
+fields and new counters, and verifies a repeated migrate is a no-op.
+It never cleans, repairs, baselines, or automatically resets a database.
 
-The automated suite covers:
+### Verification evidence — 17 October 2026
 
-- Authentication, validation, ownership, and idempotency
-- Request fingerprinting and domain lifecycle rules
-- Persistence constraints and deterministic ordering
-- Due-only, bounded notification claims
-- Locked-row exclusion and claim rollback
-- Committed claims before provider invocation
-- Provider invocation outside database transactions
-- Notification and delivery-attempt outcome persistence
-- Unexpected failures and shutdown behaviour
-- Worker enablement, polling gates, and configuration validation
-- Simulator exclusion from production and bootstrap profiles
+Local results reported for the P008 feature branch:
 
-Worker integration tests explicitly disable scheduled polling and invoke
-the processor directly. MySQL, repositories, and transaction services
-remain real; the provider and clock are mocked.
+- Standard `clean verify`: 176 tests, zero failures/errors/skips
+- Packaged operator CLI: successful replay, unchanged identical repeat,
+  and rejected conflicting reuse
+- Smoke-fixture cleanup committed; normal test tables returned to 0/0/0
+- Explicit populated upgrade rehearsal: one test, zero failures/errors/skips;
+  V2 to V4; four notifications/four attempts preserved; zero replay audits;
+  repeated migrate executed zero migrations
+
+The upgrade rehearsal is additional to, not included in, the 176-test
+standard run. These results do not establish real email delivery,
+production authorization, production rollback, or throughput. P008 PR
+review and its CI result remain separate completion gates.
 
 ## Run locally — API only
 
-Use the `local` Spring profile with the development database.
-
-In Git Bash:
+Use the `local` profile and the development database. In Git Bash, run
+password/API-key prompts individually:
 
 ```bash
 unset NOTIFICATION_WORKER_ENABLED NOTIFICATION_WORKER_POLL_ENABLED
@@ -213,43 +267,36 @@ unset NOTIFICATION_WORKER_BATCH_SIZE NOTIFICATION_WORKER_POLL_DELAY
 export DB_URL='jdbc:mysql://localhost:3306/notification_platform?serverTimezone=UTC'
 export DB_USERNAME='notification_user'
 
-read -r -s -p "Development database password: " DB_PASSWORD
+set +x
+IFS= read -r -s -p "Development database password: " DB_PASSWORD
 printf '\n'
 export DB_PASSWORD
 
-read -r -s -p "Employee-service API key: " NOTIFICATION_EMPLOYEE_API_KEY
+IFS= read -r -s -p "Local employee-service API key: " NOTIFICATION_EMPLOYEE_API_KEY
 printf '\n'
 export NOTIFICATION_EMPLOYEE_API_KEY
 
 ./mvnw spring-boot:run -Dspring-boot.run.profiles=local
 ```
 
-Use a unique, randomly generated API key of 32–256 characters.
-Each configured source application must have a distinct API key.
+Use a unique randomly generated API key of 32–256 characters. Each source
+application must have a distinct key. Never commit real passwords, keys,
+or environment files; do not rely on local YAML's fallback password.
 
-Do not commit real API keys, passwords, or environment files.
+The API listens at `http://localhost:8080`. With the worker disabled, new
+submissions remain `PENDING`.
 
-The application is available at:
-
-```text
-http://localhost:8080
-```
-
-The worker remains disabled in this mode. New submissions stay `PENDING`.
-
-Use `local` for the implemented application. The earlier `bootstrap`
-profile is not a supported standalone API mode now that persistence-backed
-services are present.
+The earlier `bootstrap` profile is not a supported standalone API mode
+now that persistence-backed services are present.
 
 ## Durable worker — local simulation only
 
-Enable simulation only against a disposable development database
-containing dummy notifications.
+Use a disposable development dataset containing only dummy notifications,
+not the automated-test database. Enabling the worker can process existing
+due `PENDING` and `RETRY_PENDING` records and recover expired
+`PROCESSING` records.
 
-Existing eligible `PENDING` records will also be processed. Never use
-the test database or a production database for this demonstration.
-
-After configuring development database credentials and the API key:
+After configuring development credentials and a local API key:
 
 ```bash
 export NOTIFICATION_WORKER_ENABLED=true
@@ -260,89 +307,130 @@ export NOTIFICATION_WORKER_POLL_DELAY=PT5S
 ./mvnw spring-boot:run -Dspring-boot.run.profiles=local
 ```
 
-The simulator sends no email and makes no provider network calls.
+The simulator always returns acceptance without sending email or making a
+provider network call. Temporary/permanent/unknown outcomes are exercised
+by tests, not by the acceptance-only local simulator.
 
-### Worker configuration
+### Worker and retry settings
 
-| Environment variable | Default | Behaviour |
+| Environment variable | Default | Validated range/meaning |
 | --- | --- | --- |
 | `NOTIFICATION_WORKER_ENABLED` | `false` | Enables the processor |
-| `NOTIFICATION_WORKER_POLL_ENABLED` | `true` | Enables scheduled polling when the worker is enabled |
-| `NOTIFICATION_WORKER_BATCH_SIZE` | `10` | Accepts values from 1 to 10 |
-| `NOTIFICATION_WORKER_POLL_DELAY` | `PT5S` | Accepts durations from 1 to 60 seconds |
+| `NOTIFICATION_WORKER_POLL_ENABLED` | `true` | Enables polling only when the worker is enabled |
+| `NOTIFICATION_WORKER_BATCH_SIZE` | `10` | 1–10 |
+| `NOTIFICATION_WORKER_POLL_DELAY` | `PT5S` | 1 second–1 minute |
+| `NOTIFICATION_RETRY_MAX_ATTEMPTS` | `5` | 1–100 total claimed attempts per cycle, including the initial one |
+| `NOTIFICATION_RETRY_INITIAL_DELAY` | `PT1M` | 1 second–24 hours |
+| `NOTIFICATION_RETRY_MAX_DELAY` | `PT15M` | 1 second–24 hours; at least the initial delay |
+| `NOTIFICATION_RETRY_PROCESSING_LEASE` | `PT5M` | 30 seconds–1 hour |
 
-Polling uses a fixed delay after the previous poll completes.
-Processing is sequential within each worker instance.
+Polling is sequential on one configured scheduler thread. Initial delay
+and fixed delay use the poll-delay setting; the fixed delay starts after
+the previous poll finishes.
 
-### Claim and processing flow
+Default temporary-failure retry delays are **1, 2, 4, and 8 minutes**.
+The five-attempt default permits four retries, so its 15-minute cap is not
+reached. Backoff has no jitter; due times are persisted in MySQL instead
+of sleeping a worker thread.
 
-Only `PENDING` notifications whose `nextAttemptAt` is due are eligible.
+### Processing and outcomes
 
-Eligible unlocked records are ordered by:
+Each batch first recovers expired claims, then claims due work. Claim
+selection orders eligible unlocked rows by:
 
 1. `nextAttemptAt`
 2. `createdAtTime`
 3. `notificationId`
 
-A short `READ_COMMITTED` transaction uses `FOR UPDATE SKIP LOCKED` to
-claim eligible records, change their status to `PROCESSING`, and insert
-incomplete delivery attempts.
+Short `REQUIRES_NEW / READ_COMMITTED` transactions handle recovery,
+claims, pre-send checks, and outcome persistence. Claims commit their
+`PROCESSING` status, counters, lease, and incomplete attempt before a
+provider is called. No database transaction spans the provider call.
 
-The claim transaction commits before provider invocation.
+| Provider outcome | Notification result |
+| --- | --- |
+| `ACCEPTED` | `SENT` |
+| `TEMPORARY_FAILURE` with budget remaining | `RETRY_PENDING` with a future due time |
+| `TEMPORARY_FAILURE` with exhausted budget | `FAILED / RETRY_EXHAUSTED` |
+| `PERMANENT_FAILURE` | `FAILED` with the safe provider failure code |
+| `UNKNOWN` | `FAILED / DELIVERY_OUTCOME_UNKNOWN` |
 
-Provider calls run outside database transactions. A separate transaction
-records each notification and delivery-attempt outcome together.
+A null provider result or provider `RuntimeException` is treated as
+unknown, not automatically retryable. Processing/database failures abort
+the batch rather than being misclassified as provider failures. The
+scheduler logs the failed poll and can poll again later.
 
-Concurrent claimers skip locked records. This protects claim exclusivity,
-but does not guarantee strict global FIFO execution across worker instances.
+Counters have different meanings:
 
-### Provider outcomes
+- `last_attempt_number`: lifetime attempt sequence, incremented at claim;
+  retained across manual replay. Sparse legacy history means it is not
+  necessarily the number of attempt rows.
+- `cycle_attempt_count`: claimed attempts in the current cycle, including
+  claims that might never reach the provider; reset by manual replay.
+- `retry_count`: cumulative scheduled automatic retries, not total sends;
+  retained across manual replay.
 
-- `ACCEPTED`: notification becomes `SENT`
-- `PERMANENT_FAILURE`: notification becomes `FAILED`
-- `TEMPORARY_FAILURE`: notification becomes `RETRY_PENDING`, with a
-  recorded one-minute delay
+### Recovery and limits
 
-P007 does not consume `RETRY_PENDING`. Retry execution, backoff, and
-exhaustion belong to P008.
+Expired incomplete claims are closed as unknown and marked
+`FAILED / DELIVERY_OUTCOME_UNKNOWN`. Missing current attempt history
+produces `FAILED / ATTEMPT_HISTORY_MISSING`. Legacy NULL leases use a
+last-attempt cutoff. Existing closed/partially closed history is preserved.
 
-The simulated provider is available only when `local` or `test` is active
-and neither `prod` nor `bootstrap` is active.
+Recovery does **not** automatically resend uncertain delivery. It runs
+when the batch processor runs; disabling the worker also stops its
+scheduled recovery.
 
-Enabling the worker without an eligible `EmailProvider` causes startup
-to fail.
+All claims in a batch share an initial expiry. Queue wait and provider
+execution consume that lease. There is currently no lease renewal,
+heartbeat, or real-provider timeout implementation.
 
-### Current reliability limits
+`SKIP LOCKED` supports exclusive claims, not strict global FIFO or an
+exact lock-footprint bound. Query-plan/contention testing is required
+before scaling to multiple workers. See [MySQL locking reads](https://dev.mysql.com/doc/refman/9.7/en/innodb-locking-reads.html)
+and [InnoDB lock scope](https://dev.mysql.com/doc/refman/9.7/en/innodb-locks-set.html).
 
-Crashes, shutdown, unexpected provider failures, or outcome-persistence
-failures can leave notifications `PROCESSING` with incomplete attempts.
+A lease cannot cancel/fence an external sender. Graceful shutdown stops
+new work when observed but cannot promise cancellation of an in-flight
+provider call. Submission idempotency and exclusive claims do **not**
+guarantee exactly-once email delivery.
 
-Claimed but not yet sent notifications can also remain `PROCESSING`
-during shutdown. Recovery is planned for P008.
-
-Provider acceptance followed by a failed database commit creates an
-uncertain outcome. Do not blindly resend these notifications.
-
-Exclusive database claims and submission idempotency do not guarantee
-exactly-once email delivery.
-
-After stopping the demonstration, clear worker overrides before testing
-or returning to API-only development:
+Clear worker overrides after stopping a demonstration:
 
 ```bash
 unset NOTIFICATION_WORKER_ENABLED NOTIFICATION_WORKER_POLL_ENABLED
 unset NOTIFICATION_WORKER_BATCH_SIZE NOTIFICATION_WORKER_POLL_DELAY
 ```
 
+## Operator replay and migrations
+
+Manual replay is an explicit operator-only, non-web CLI with audit
+records, version checks, and command idempotency. There is no replay HTTP
+endpoint. It requeues eligible failed work; it does not itself send email.
+
+Follow [the operator replay and rollout runbook](docs/operator-replay.md).
+Do not treat acknowledgement flags or an OS username as authentication or
+proof that a previous sender has stopped.
+
+Migrations:
+
+- V1: notification and delivery-attempt tables
+- V2: case-sensitive source/idempotency keys
+- V3: retry counters, processing lease, conservative history backfill,
+  recovery index, and UNKNOWN attempt outcome
+- V4: immutable-through-application replay audit records
+
+Stop old application writers/workers and operator commands before V3/V4
+rollout. Use one controlled migrator and a verified backup/restore plan.
+The backfill is not a zero-downtime rolling-upgrade procedure.
+
 ## API usage
 
-The API is intended for backend applications and accepts plain-text
-notification content.
+These examples are for local dummy credentials/data only. Run them in a
+terminal where `NOTIFICATION_EMPLOYEE_API_KEY` is set. The API accepts
+plain-text notification content.
 
-Set `NOTIFICATION_EMPLOYEE_API_KEY` in the terminal used for these
-commands. A second terminal does not inherit values entered in the first.
-
-### Submit a notification
+### Submit
 
 ```bash
 curl -i 'http://localhost:8080/api/v1/notifications' \
@@ -350,36 +438,26 @@ curl -i 'http://localhost:8080/api/v1/notifications' \
   -H 'Content-Type: application/json' \
   --data '{
     "idempotencyKey": "employee-created-101",
-    "recipientEmail": "recipient@example.com",
+    "recipientEmail": "nobody@example.invalid",
     "subject": "Welcome",
-    "body": "Welcome to the application."
+    "body": "Local demonstration only."
   }'
 ```
 
-Submission outcomes:
+- `202 Accepted`: a new notification was committed to MySQL
+- `200 OK`: an identical request returned its existing notification
+- `409 Conflict`: the same business key had different content
 
-- `202 Accepted`: a new notification has been committed to MySQL
-- `200 OK`: an identical request returned the existing notification
-- `409 Conflict`: the same business key was used with different content
+The business key is `(sourceApplication, idempotencyKey)`. Source comes
+from the authenticated API key, not the body. Comparisons are
+case-sensitive. The same idempotency key in two source applications
+represents two notifications. Conflicts do not overwrite original data.
 
-The business key is:
-
-```text
-(sourceApplication, idempotencyKey)
-```
-
-The source application comes from the authenticated API key, not the
-request body.
-
-Business-key comparisons are case-sensitive. The same idempotency key
-from two different applications represents two different notifications.
-
-A conflicting request does not overwrite the original notification.
-Acceptance confirms durable submission, not completed email delivery.
+Acceptance confirms durable submission, not email delivery.
 
 ### Retrieve status
 
-Replace `NOTIFICATION_ID` with the ID returned by submission:
+Replace `NOTIFICATION_ID` with the submission result:
 
 ```bash
 curl -i \
@@ -387,96 +465,55 @@ curl -i \
   -H "X-API-Key: $NOTIFICATION_EMPLOYEE_API_KEY"
 ```
 
-The response masks the recipient and omits the email body.
+The response masks the recipient and omits the body. A missing
+notification or one owned by another application returns `404`.
 
-A missing notification or one owned by another application returns
-`404 Not Found`.
+Statuses: `PENDING`, `PROCESSING`, `RETRY_PENDING`, `SENT`, `FAILED`.
 
-Notification statuses are:
-
-- `PENDING`
-- `PROCESSING`
-- `RETRY_PENDING`
-- `SENT`
-- `FAILED`
-
-### Health
+### Health and errors
 
 ```bash
 curl 'http://localhost:8080/actuator/health'
 ```
 
-Only health endpoints are exposed through Actuator.
+Only health endpoints are exposed through Actuator. Health does not
+prove provider availability or delivery.
 
-A healthy application does not prove provider availability or email
-delivery. The current simulated provider sends no email.
+API errors use `application/problem+json` with an error code and
+correlation ID: authentication `401`; invalid input `400`; missing or
+inaccessible notification `404`; idempotency conflict `409`; unexpected
+failure `500`.
 
-## Error handling
+Logs must not contain passwords, API keys, email bodies, or unmasked
+request payloads. Worker logs use IDs/outcomes and error types.
 
-- Missing or invalid API key: `401`
-- Invalid request, malformed JSON, or invalid notification ID: `400`
-- Missing or inaccessible notification: `404`
-- Conflicting idempotency request: `409`
-- Unexpected application failure: `500`
+## Production readiness and contribution workflow
 
-Errors use `application/problem+json`.
-Responses include an error code and correlation ID.
+Remaining production work includes real provider integration and bounded
+timeouts; deployment-specific authorization, HTTPS, key rotation and
+secret management; least-privilege separate accounts; metrics, alerts,
+backup/restore verification, rollout controls, and representative load
+and contention tests.
 
-Worker logs identify notifications and attempts without logging email
-payloads. Unexpected provider errors are not automatically converted
-into retryable failures.
+Do not present simulated acceptance as actual email delivery or the
+operator CLI as a complete production privileged-access system.
 
-Do not log API keys, database passwords, or unmasked request bodies.
+GitHub Actions is configured for pull requests to `main`, pushes to
+`main`, and manual dispatch. It uses Java 17, Maven Wrapper, and its own
+disposable MySQL 8.4 service with dummy credentials.
 
-## Security and production readiness
-
-The current implementation is production-oriented, not production-ready.
-
-Before production deployment, complete the remaining work, including:
-
-- Real provider integration and bounded provider-call timeouts
-- Retry execution and interrupted-work recovery
-- Handling of uncertain provider outcomes
-- HTTPS and deployment-specific security controls
-- Secure secret management and API-key rotation
-- Separate migration and least-privilege runtime database access
-- Operational metrics, alerting, and deployment verification
-
-Do not use the simulated provider as evidence of actual email delivery.
-
-## Continuous integration
-
-GitHub Actions is configured to verify pull requests targeting `main`
-and pushes to `main` using Java 17, the Maven Wrapper, and a disposable
-MySQL 8.4 service.
-
-CI database credentials are dummy values used only by that temporary
-service. No production secrets are required.
-
-Run the complete build locally before requesting review.
-The feature pull request must pass CI before merging.
-
-## Contribution workflow
-
-1. Update the local `main` branch.
-2. Create a feature branch for the milestone or change.
-3. Implement the changes and automated tests.
+1. Update local `main` before starting new work.
+2. Create a feature branch.
+3. Implement and test the intended change.
 4. Run `./mvnw clean verify` and `git diff --check`.
-5. Review and stage the intended changes.
+5. Review and stage the intended changes, including new files.
 6. Commit and push the feature branch.
 7. Open a pull request targeting `main`.
-8. Review the diff and passing CI results before merging.
+8. Review the full diff and passing CI before merging.
 
-Do not push application changes directly to `main`.
-Do not commit credentials, generated build output, or local environment files.
+Do not switch branches mid-change, push application changes directly to
+`main`, or commit generated output, credentials, or environment files.
 
-## Planned development
-
-- P008: retry execution, backoff, exhaustion, and interrupted-work recovery
-- P009: real email-provider adapters and failure classification
-- Operational metrics and deployment hardening
-- Separate worker deployment
-- Redis and Kafka integration
-- Kubernetes deployment
-
-These are planned capabilities, not features of the current implementation.
+Next planned capabilities include P009 real provider integration,
+operational hardening, separate worker deployment, and later Redis,
+Kafka, and Kubernetes work. These are not current implemented features.

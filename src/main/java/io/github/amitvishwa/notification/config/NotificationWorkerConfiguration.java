@@ -4,13 +4,16 @@ import io.github.amitvishwa.notification.application.port.email.EmailProvider;
 import io.github.amitvishwa.notification.application.processing.NotificationBatchProcessor;
 import io.github.amitvishwa.notification.application.processing.NotificationClaimService;
 import io.github.amitvishwa.notification.application.processing.NotificationOutcomeService;
+import io.github.amitvishwa.notification.application.processing.NotificationRecoveryService;
 import io.github.amitvishwa.notification.worker.NotificationWorkerScheduler;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Profile;
 import org.springframework.scheduling.annotation.EnableScheduling;
 
+@Profile("!operator-replay")
 @Configuration(proxyBeanMethods = false)
 @EnableScheduling
 @EnableConfigurationProperties(NotificationWorkerProperties.class)
@@ -26,11 +29,13 @@ public class NotificationWorkerConfiguration {
     public NotificationBatchProcessor notificationBatchProcessor(
             NotificationClaimService claimService,
             NotificationOutcomeService outcomeService,
+            NotificationRecoveryService recoveryService,
             EmailProvider emailProvider
     ) {
         return new NotificationBatchProcessor(
                 claimService,
                 outcomeService,
+                recoveryService,
                 emailProvider
         );
     }
