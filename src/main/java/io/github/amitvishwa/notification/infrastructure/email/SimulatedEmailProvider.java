@@ -13,12 +13,18 @@ import java.util.Objects;
  * Simulates provider acceptance without sending an email.
  */
 @Component
-@Profile("(local | test) & !prod & !bootstrap")
+@Profile("(local | test) & !prod & !bootstrap & !operator-replay")
 @ConditionalOnProperty(
         prefix = "notification.worker",
         name = "enabled",
         havingValue = "true",
         matchIfMissing = false
+)
+@ConditionalOnProperty(
+        prefix = "notification.email",
+        name = "provider",
+        havingValue = "simulated",
+        matchIfMissing = true
 )
 public class SimulatedEmailProvider implements EmailProvider {
 
