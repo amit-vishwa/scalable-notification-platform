@@ -76,6 +76,45 @@ Use the repository's Maven Wrapper; a separate Maven installation is not
 required. Local verification has used MySQL 9.7. CI is configured for
 MySQL 8.4. Docker Desktop is not required for local development/testing.
 
+### Windows toolchain verification
+
+Install JDK 17 and set `JAVA_HOME` to the JDK installation directory,
+not its `bin` subdirectory. Add `%JAVA_HOME%\bin` to `PATH`.
+
+After changing environment variables, restart terminals and IDEs so
+they receive the updated values.
+
+From the repository root, verify the Java runtime and compiler:
+
+```text
+java -version
+javac -version
+```
+
+Both commands should report Java 17.
+
+Verify the Maven Wrapper using the command for your shell.
+
+PowerShell:
+
+```powershell
+.\mvnw.cmd --version
+```
+
+Git Bash:
+
+```bash
+./mvnw --version
+```
+
+Maven should report Java 17 and the Maven version configured in
+`.mvn/wrapper/maven-wrapper.properties`. The first wrapper invocation
+requires internet access to download Maven if it is not already cached.
+
+These version checks do not build the application, run tests, start
+the worker, or require MySQL. Database-backed execution and integration
+tests require the separate database setup below.
+
 ## Local database setup
 
 Keep development and automated-test databases/accounts separate:
