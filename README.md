@@ -4,9 +4,11 @@ A production-oriented, server-to-server notification backend with durable,
 asynchronous processing.
 
 The project is under development and is **not yet production-ready**.
-The current provider simulates acceptance without sending email.
+Email sending supports selectable simulator and SMTP adapters. The
+simulator does not send email; the SMTP adapter submits to a configured
+SMTP server.
 
-## Current implementation — P008
+## Current implementation — P009
 
 Implemented:
 
@@ -23,11 +25,15 @@ Implemented:
 - Processing leases and conservative interrupted-work recovery
 - Audited, opt-in operator replay through a non-web command-line mode
 - A non-sending simulator restricted to eligible local/test configurations
+- Selectable SMTP adapter without changing the worker's provider contract
+- Validated SMTP/TLS settings and finite connection/read/write timeouts
+- UTF-8 single-recipient plaintext MIME and header-injection rejection
+- Conservative SMTP failure classification and safe internal failure codes
 - Unit, configuration, real-MySQL integration, and explicit upgrade-rehearsal tests
 
 Still to implement or verify:
 
-- Real email-provider adapters, bounded network timeouts, and delivery feedback
+- External SMTP-service validation and mailbox-delivery feedback
 - Production authorization, secrets, deployment, observability, and hardening
 - Representative query-plan, lock-contention, and multi-worker throughput testing
 - Separate worker deployment, Redis, Kafka, and Kubernetes
@@ -37,14 +43,16 @@ scheduled worker. The worker is disabled by default. New submissions stay
 `PENDING` until processing is enabled.
 
 `SENT` means provider acceptance, not confirmed mailbox delivery.
-With the current simulator it means simulated acceptance only.
+For the simulator this is simulated acceptance. For SMTP it means the
+submission completed successfully. Mailpit capture proves local SMTP
+receipt, not delivery to an external mailbox.
 
 ## Technology and architecture
 
 - Java 17
 - Spring Boot 4.1.1
 - Maven Wrapper
-- Native MySQL locally; MySQL 8.4 in the CI service
+- MySQL running natively or in Docker locally; MySQL 8.4 in CI
 - Spring Data JPA and Flyway
 - JUnit, Mockito, and AssertJ
 
@@ -69,12 +77,16 @@ In-memory collections are not the primary notification store.
 
 - JDK 17
 - Git
-- Native MySQL Server
+- MySQL Server, either native or containerized
 - An editor or IDE
 
 Use the repository's Maven Wrapper; a separate Maven installation is not
-required. Local verification has used MySQL 9.7. CI is configured for
-MySQL 8.4. Docker Desktop is not required for local development/testing.
+required. P009 local verification used MySQL 8.4.13 in Docker. Earlier
+local verification used native MySQL 9.7; CI uses MySQL 8.4.
+
+Docker Desktop is optional when using native MySQL. The
+[local SMTP capture guide](docs/local-smtp-demo.md) uses Mailpit in Docker.
+Standard SMTP unit/configuration tests do not require a live SMTP server.
 
 ### Windows toolchain verification
 
@@ -117,9 +129,21 @@ tests require the separate database setup below.
 
 ## Local database setup
 
+The account hosts and SQL examples in this section describe native MySQL.
+The reviewed Windows-to-container setup instead uses
+`notification_user@'%'` and `notification_test@'%'`, with the MySQL host
+port bound only to `127.0.0.1:3306`.
+
+For a fresh container setup, create those two dedicated accounts with
+`@'%'` and apply the same exact table-level grants to those identities.
+Do not run the native `@'localhost'` account statements unchanged for
+that setup, alter existing accounts, or replace account hosts throughout
+the runbooks. The separate opt-in upgrade rehearsal retains its
+`notification_upgrade_test@localhost` identity requirement.
+
 Keep development and automated-test databases/accounts separate:
 
-| Purpose | Database | Account |
+| Purpose | Database | Native MySQL account |
 | --- | --- | --- |
 | Development | `notification_platform` | `notification_user@localhost` |
 | Automated tests | `notification_platform_test` | `notification_test@localhost` |
@@ -207,7 +231,7 @@ edit migrations already applied to a database.
 
 The standard suite requires:
 
-- Native MySQL running
+- MySQL running, natively or in Docker
 - `notification_platform_test` and its dedicated account
 - `NOTIFICATION_TEST_DB_PASSWORD` in the current terminal
 - Empty `notification`, `delivery_attempt`, and `notification_replay` tables
@@ -265,6 +289,11 @@ credentials. Negative tests can log expected database constraint failures
 or refused application contexts. The final summary must have zero
 unexpected failures/errors.
 
+SMTP adapter/configuration tests use synthetic messages, mocked senders
+or disconnected configuration objects. The standard CI suite does not
+start Mailpit or verify real SMTP transport. The local capture
+demonstration is a separate verification step.
+
 ### Explicit populated-schema upgrade rehearsal
 
 `NotificationMigrationUpgradeRehearsal` is deliberately outside Surefire's
@@ -293,6 +322,20 @@ The upgrade rehearsal is additional to, not included in, the 176-test
 standard run. These results do not establish real email delivery,
 production authorization, production rollback, or throughput. P008 PR
 review and its CI result remain separate completion gates.
+
+### Verification evidence — 25 October 2026
+
+Local results reported for the P009 feature branch:
+
+- Fresh full `clean verify`: 248 tests, zero failures/errors/skips
+- Executable JAR packaged successfully
+- Local Mailpit demonstration: POST returned `202`, persisted status reached
+  `SENT`, and one message was captured
+- An identical repeat returned `200` with the same notification ID
+
+These are local results. PR review and CI are separate delivery gates.
+SMTP capture does not establish external inbox delivery, production
+readiness, throughput or exactly-once delivery.
 
 ## Run locally — API only
 
@@ -328,7 +371,11 @@ submissions remain `PENDING`.
 The earlier `bootstrap` profile is not a supported standalone API mode
 now that persistence-backed services are present.
 
-## Durable worker — local simulation only
+## Durable worker and email providers
+
+The following commands use the non-sending simulator. For an SMTP
+demonstration, follow the
+[local SMTP capture guide](docs/local-smtp-demo.md).
 
 Use a disposable development dataset containing only dummy notifications,
 not the automated-test database. Enabling the worker can process existing
@@ -338,6 +385,7 @@ due `PENDING` and `RETRY_PENDING` records and recover expired
 After configuring development credentials and a local API key:
 
 ```bash
+export NOTIFICATION_EMAIL_PROVIDER=simulated
 export NOTIFICATION_WORKER_ENABLED=true
 export NOTIFICATION_WORKER_POLL_ENABLED=true
 export NOTIFICATION_WORKER_BATCH_SIZE=10
@@ -349,6 +397,57 @@ export NOTIFICATION_WORKER_POLL_DELAY=PT5S
 The simulator always returns acceptance without sending email or making a
 provider network call. Temporary/permanent/unknown outcomes are exercised
 by tests, not by the acceptance-only local simulator.
+
+### Email provider settings
+
+The worker depends on the `EmailProvider` strategy. The SMTP adapter
+translates that contract to Spring/Jakarta Mail; configuration selects
+the implementation without rewriting processing or persistence.
+
+Use canonical Spring property names:
+
+| Property | Default | Requirement |
+| --- | --- | --- |
+| `notification.email.provider` | `SIMULATED` | `SIMULATED` or `SMTP` |
+| `notification.email.smtp.host` | None | Required for active SMTP |
+| `notification.email.smtp.port` | `587` | 1–65535; configure the intended port explicitly |
+| `notification.email.smtp.from-address` | None | One valid plain mailbox |
+| `notification.email.smtp.security` | `STARTTLS` | `PLAIN`, `STARTTLS` or `SMTPS` |
+| `notification.email.smtp.authentication` | `false` | Enables SMTP authentication |
+| `notification.email.smtp.username` | None | Required with authentication; absent otherwise |
+| `notification.email.smtp.password` | None | Required with authentication; absent otherwise |
+| `notification.email.smtp.connection-timeout` | `PT5S` | 1–30 seconds |
+| `notification.email.smtp.read-timeout` | `PT5S` | 1–30 seconds |
+| `notification.email.smtp.write-timeout` | `PT5S` | 1–30 seconds |
+
+SMTP properties are bound only when SMTP is selected and the worker is
+enabled, outside bootstrap/operator-replay modes. Unknown provider values
+fail startup when provider selection is active. The simulator remains
+restricted to eligible local/test profiles.
+
+PLAIN requires an explicit loopback host and an eligible local/test
+profile without prod. Authentication requires credentials and encrypted
+transport. STARTTLS is required rather than opportunistic; encrypted
+modes verify server identity. SMTPS does not automatically change the
+configured port. Bootstrap and operator-replay modes do not activate SMTP.
+
+Use only `notification.email.*` for this provider configuration.
+Unrelated `spring.mail.*` settings can independently enable Spring
+Boot's standard mail auto-configuration.
+
+The SMTP adapter sends one UTF-8 plaintext message. Its successful result
+does not invent a provider queue identifier from the MIME Message-ID.
+
+Recognized socket-connection failures and unambiguous SMTP 4xx rejections
+are temporary failures. Explicit 5xx rejections and invalid messages are
+permanent failures. Authentication failures follow a fail-fast
+operator-correction policy.
+
+Ambiguous transmission/cleanup failures, partial acceptance, conflicting
+evidence and unsafe exception chains remain UNKNOWN and are not
+automatically retried. The SMTP unknown code is stored on the delivery
+attempt as `SMTP_DELIVERY_OUTCOME_UNKNOWN`; the notification/status API
+uses `DELIVERY_OUTCOME_UNKNOWN`.
 
 ### Worker and retry settings
 
@@ -421,8 +520,10 @@ when the batch processor runs; disabling the worker also stops its
 scheduled recovery.
 
 All claims in a batch share an initial expiry. Queue wait and provider
-execution consume that lease. There is currently no lease renewal,
-heartbeat, or real-provider timeout implementation.
+execution consume that lease. There is currently no lease renewal or
+heartbeat. The SMTP adapter has finite connection/read/write timeouts,
+but these do not establish a strict whole-send deadline or guarantee
+completion within a processing lease.
 
 `SKIP LOCKED` supports exclusive claims, not strict global FIFO or an
 exact lock-footprint bound. Query-plan/contention testing is required
@@ -437,6 +538,7 @@ guarantee exactly-once email delivery.
 Clear worker overrides after stopping a demonstration:
 
 ```bash
+unset NOTIFICATION_EMAIL_PROVIDER
 unset NOTIFICATION_WORKER_ENABLED NOTIFICATION_WORKER_POLL_ENABLED
 unset NOTIFICATION_WORKER_BATCH_SIZE NOTIFICATION_WORKER_POLL_DELAY
 ```
@@ -528,14 +630,15 @@ request payloads. Worker logs use IDs/outcomes and error types.
 
 ## Production readiness and contribution workflow
 
-Remaining production work includes real provider integration and bounded
-timeouts; deployment-specific authorization, HTTPS, key rotation and
-secret management; least-privilege separate accounts; metrics, alerts,
+Remaining production work includes external SMTP-service and
+mailbox-delivery validation, a strict whole-send deadline,
+deployment-specific authorization, HTTPS, key rotation and secret
+management, least-privilege separate accounts, metrics, alerts,
 backup/restore verification, rollout controls, and representative load
 and contention tests.
 
-Do not present simulated acceptance as actual email delivery or the
-operator CLI as a complete production privileged-access system.
+Do not present simulated or SMTP acceptance as confirmed mailbox delivery,
+or the operator CLI as a complete production privileged-access system.
 
 GitHub Actions is configured for pull requests to `main`, pushes to
 `main`, and manual dispatch. It uses Java 17, Maven Wrapper, and its own
@@ -553,6 +656,6 @@ disposable MySQL 8.4 service with dummy credentials.
 Do not switch branches mid-change, push application changes directly to
 `main`, or commit generated output, credentials, or environment files.
 
-Next planned capabilities include P009 real provider integration,
-operational hardening, separate worker deployment, and later Redis,
-Kafka, and Kubernetes work. These are not current implemented features.
+Remaining capabilities include mailbox-delivery feedback, operational
+hardening, separate worker deployment, and later Redis, Kafka and
+Kubernetes work. These are not current implemented features.
