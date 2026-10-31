@@ -8,7 +8,7 @@ Email sending supports selectable simulator and SMTP adapters. The
 simulator does not send email; the SMTP adapter submits to a configured
 SMTP server.
 
-## Current implementation — P009
+## Current implementation — P010
 
 Implemented:
 
@@ -29,11 +29,18 @@ Implemented:
 - Validated SMTP/TLS settings and finite connection/read/write timeouts
 - UTF-8 single-recipient plaintext MIME and header-injection rejection
 - Conservative SMTP failure classification and safe internal failure codes
+- Versioned, application-scoped email preferences with explicit opt-in
+- Daily named-timezone quiet hours and durable deferral
+- Terminal suppression with distinct preference-related reasons
+- Preference checks before delivery-attempt creation
+- Protection against recipient fragments in raw Hibernate JDBC logs
 - Unit, configuration, real-MySQL integration, and explicit upgrade-rehearsal tests
 
 Still to implement or verify:
 
 - External SMTP-service validation and mailbox-delivery feedback
+- Combined P010 preference-to-live-SMTP demonstration
+- Populated V4-to-V5 upgrade rehearsal
 - Production authorization, secrets, deployment, observability, and hardening
 - Representative query-plan, lock-contention, and multi-worker throughput testing
 - Separate worker deployment, Redis, Kafka, and Kubernetes
@@ -41,6 +48,14 @@ Still to implement or verify:
 The default operating scope remains one deployment with one sequential
 scheduled worker. The worker is disabled by default. New submissions stay
 `PENDING` until processing is enabled.
+
+When processing is enabled, an explicit enabled preference must exist
+for the exact source application and recipient. After retry-exhaustion
+checks, missing or disabled preferences suppress eligible work; quiet
+hours defer it.
+
+See the [email preferences guide](docs/email-preferences.md) for the API,
+claim-time semantics and rollout requirements.
 
 `SENT` means provider acceptance, not confirmed mailbox delivery.
 For the simulator this is simulated acceptance. For SMTP it means the
@@ -63,8 +78,8 @@ Base package: `io.github.amitvishwa.notification`
 | Package | Responsibility |
 | --- | --- |
 | `api` | HTTP controllers, DTOs, authentication, and API errors |
-| `application` | Submission, queries, idempotency, provider ports, processing, and replay use cases |
-| `domain` | Notification models, lifecycle rules, and retry policy |
+| `application` | Submission, queries, preferences, idempotency, provider ports, processing, and replay use cases |
+| `domain` | Notification/preference models, lifecycle rules, quiet hours, and retry policy |
 | `infrastructure` | Persistence and provider implementations |
 | `config` | Application configuration and startup safety gates |
 | `worker` | Scheduled background polling |
@@ -199,6 +214,9 @@ GRANT ALL PRIVILEGES ON
     `notification_platform`.`notification_replay`
     TO 'notification_user'@'localhost';
 GRANT ALL PRIVILEGES ON
+    `notification_platform`.`email_preference`
+    TO 'notification_user'@'localhost';
+GRANT ALL PRIVILEGES ON
     `notification_platform`.`flyway_schema_history`
     TO 'notification_user'@'localhost';
 
@@ -210,6 +228,9 @@ GRANT ALL PRIVILEGES ON
     TO 'notification_test'@'localhost';
 GRANT ALL PRIVILEGES ON
     `notification_platform_test`.`notification_replay`
+    TO 'notification_test'@'localhost';
+GRANT ALL PRIVILEGES ON
+    `notification_platform_test`.`email_preference`
     TO 'notification_test'@'localhost';
 GRANT ALL PRIVILEGES ON
     `notification_platform_test`.`flyway_schema_history`
@@ -285,9 +306,10 @@ Remove-Item -LiteralPath `
 ```
 
 The test profile supplies dummy API keys; do not replace them with real
-credentials. Negative tests can log expected database constraint failures
-or refused application contexts. The final summary must have zero
-unexpected failures/errors.
+credentials. Negative tests exercise expected database constraint failures
+and refused application contexts. Raw Hibernate JDBC error/warning
+messages are disabled to avoid exposing recipient-derived key values.
+The final summary must have zero unexpected failures/errors.
 
 SMTP adapter/configuration tests use synthetic messages, mocked senders
 or disconnected configuration objects. The standard CI suite does not
@@ -305,6 +327,8 @@ Follow [the upgrade rehearsal guide](docs/upgrade-rehearsal.md). It applies
 V1/V2, inserts synthetic historical data, applies V3/V4, validates all old
 fields and new counters, and verifies a repeated migrate is a no-op.
 It never cleans, repairs, baselines, or automatically resets a database.
+
+This historical rehearsal verifies V2 to V4 only; it does not verify V5.
 
 ### Verification evidence — 17 October 2026
 
@@ -336,6 +360,21 @@ Local results reported for the P009 feature branch:
 These are local results. PR review and CI are separate delivery gates.
 SMTP capture does not establish external inbox delivery, production
 readiness, throughput or exactly-once delivery.
+
+### P010 verification status — 31 October 2026
+
+- Final post-review `clean verify`: 452 tests, zero
+  failures/errors/skips; completed at 22:14:33 IST.
+- Executable JAR packaged successfully after the operator-configuration
+  refinement.
+- Coverage includes real-MySQL preference/API/worker tests, concurrent
+  creation and updates, suppression status, logging privacy and all
+  30 operator-safety cases.
+- PR review, CI and merge remain separate delivery gates.
+
+These results do not establish a populated V4-to-V5 upgrade or a rerun of
+the combined P010 preference-to-live-SMTP demonstration. Historical P008
+and P009 evidence remains separate.
 
 ## Run locally — API only
 
@@ -480,6 +519,15 @@ selection orders eligible unlocked rows by:
 2. `createdAtTime`
 3. `notificationId`
 
+After checking retry exhaustion, the worker evaluates the current
+preference for the exact source application and recipient at the batch's
+claim timestamp. Missing/disabled preferences suppress work without a new
+attempt. Quiet hours persist a future due time without consuming retry
+budget. Only an explicit allow decision creates a delivery attempt.
+
+Preference changes affect subsequent eligible claims, not already-claimed
+work, and do not pull forward an existing `nextAttemptAt`.
+
 Short `REQUIRES_NEW / READ_COMMITTED` transactions handle recovery,
 claims, pre-send checks, and outcome persistence. Claims commit their
 `PROCESSING` status, counters, lease, and incomplete attempt before a
@@ -560,16 +608,31 @@ Migrations:
 - V3: retry counters, processing lease, conservative history backfill,
   recovery index, and UNKNOWN attempt outcome
 - V4: immutable-through-application replay audit records
+- V5: application-scoped email preferences and notification suppression
 
 Stop old application writers/workers and operator commands before V3/V4
 rollout. Use one controlled migrator and a verified backup/restore plan.
 The backfill is not a zero-downtime rolling-upgrade procedure.
+
+V5 also requires a stopped-writer rollout, not mixed P009/P010 binaries.
+Keep workers disabled while only explicitly approved preferences are
+created and due work is reviewed; do not automatically backfill opt-ins.
+See the [preferences rollout requirements](docs/email-preferences.md#v5-rollout-and-verification-limits).
+A populated V4-to-V5 rehearsal remains pending; historical V2-to-V4
+evidence does not validate V5.
 
 ## API usage
 
 These examples are for local dummy credentials/data only. Run them in a
 terminal where `NOTIFICATION_EMPLOYEE_API_KEY` is set. The API accepts
 plain-text notification content.
+
+For a delivery demonstration, first create an enabled preference for the
+exact example recipient using the same authenticated application. Follow
+the [preferences API guide](docs/email-preferences.md).
+
+Submission acceptance still confirms persistence, not permission to send
+or completed delivery.
 
 ### Submit
 
@@ -579,7 +642,7 @@ curl -i 'http://localhost:8080/api/v1/notifications' \
   -H 'Content-Type: application/json' \
   --data '{
     "idempotencyKey": "employee-created-101",
-    "recipientEmail": "nobody@example.invalid",
+    "recipientEmail": "recipient@example.invalid",
     "subject": "Welcome",
     "body": "Local demonstration only."
   }'
@@ -609,7 +672,13 @@ curl -i \
 The response masks the recipient and omits the body. A missing
 notification or one owned by another application returns `404`.
 
-Statuses: `PENDING`, `PROCESSING`, `RETRY_PENDING`, `SENT`, `FAILED`.
+Statuses: `PENDING`, `PROCESSING`, `RETRY_PENDING`, `SENT`, `FAILED`,
+`SUPPRESSED`.
+
+For suppressed work, `suppressionReason` is `PREFERENCE_MISSING` or
+`EMAIL_DISABLED`; `failureCode` remains null. Suppression is terminal:
+later opt-in does not resurrect it, an identical submission returns its
+existing record, and operator replay cannot bypass it.
 
 ### Health and errors
 
@@ -622,11 +691,20 @@ prove provider availability or delivery.
 
 API errors use `application/problem+json` with an error code and
 correlation ID: authentication `401`; invalid input `400`; missing or
-inaccessible notification `404`; idempotency conflict `409`; unexpected
-failure `500`.
+inaccessible notification/preference `404`; idempotency or preference
+conflict `409`; unexpected failure `500`.
+
+Preference duplicate creation returns `PREFERENCE_ALREADY_EXISTS`;
+stale versions return `PREFERENCE_VERSION_CONFLICT`. A concurrent
+database update may return `CONCURRENT_MODIFICATION`. Retrieve the
+current preference and review before retrying.
 
 Logs must not contain passwords, API keys, email bodies, or unmasked
-request payloads. Worker logs use IDs/outcomes and error types.
+request payloads. Worker logs use IDs/outcomes and error types. Raw
+Hibernate JDBC error/warning logging is disabled because driver messages
+can contain recipient-derived key values. Exceptions still propagate;
+safe application-level error handling remains active. Do not enable
+sensitive SQL bind tracing.
 
 ## Production readiness and contribution workflow
 

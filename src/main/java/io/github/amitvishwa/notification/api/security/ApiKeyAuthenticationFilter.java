@@ -10,6 +10,9 @@ import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Component;
 import org.springframework.web.filter.OncePerRequestFilter;
+import org.springframework.web.util.ServletRequestPathUtils;
+import org.springframework.web.util.pattern.PathPattern;
+import org.springframework.web.util.pattern.PathPatternParser;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -29,6 +32,9 @@ public class ApiKeyAuthenticationFilter extends OncePerRequestFilter {
     private static final String API_KEY_HEADER = "X-API-Key";
     private static final String CORRELATION_HEADER = "X-Correlation-ID";
 
+    private static final PathPattern API_PATHS =
+            PathPatternParser.defaultInstance.parse("/api/v1/**");
+
     private final List<Credential> credentials;
 
     public ApiKeyAuthenticationFilter(ApiKeyProperties properties) {
@@ -44,10 +50,10 @@ public class ApiKeyAuthenticationFilter extends OncePerRequestFilter {
 
     @Override
     protected boolean shouldNotFilter(HttpServletRequest request) {
-        String path = request.getServletPath();
-
-        return !path.equals("/api/v1/notifications")
-                && !path.startsWith("/api/v1/notifications/");
+        return !API_PATHS.matches(
+                ServletRequestPathUtils.parse(request)
+                        .pathWithinApplication()
+        );
     }
 
     @Override

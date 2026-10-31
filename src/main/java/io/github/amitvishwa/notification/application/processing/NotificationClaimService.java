@@ -1,10 +1,13 @@
 package io.github.amitvishwa.notification.application.processing;
 
 import io.github.amitvishwa.notification.application.port.email.EmailMessage;
+import io.github.amitvishwa.notification.application.preference.PreferenceDecision;
+import io.github.amitvishwa.notification.application.preference.PreferenceEvaluationService;
 import io.github.amitvishwa.notification.config.NotificationRetryProperties;
 import io.github.amitvishwa.notification.domain.model.DeliveryAttempt;
 import io.github.amitvishwa.notification.domain.model.Notification;
 import io.github.amitvishwa.notification.domain.policy.RetryPolicy;
+import io.github.amitvishwa.notification.domain.preference.PreferenceKey;
 import io.github.amitvishwa.notification.infrastructure.persistence.DeliveryAttemptRepository;
 import io.github.amitvishwa.notification.infrastructure.persistence.NotificationRepository;
 import org.springframework.stereotype.Service;
@@ -27,6 +30,7 @@ public class NotificationClaimService {
 
     private final NotificationRepository notifications;
     private final DeliveryAttemptRepository attempts;
+    private final PreferenceEvaluationService preferenceEvaluation;
     private final RetryPolicy retryPolicy;
     private final NotificationRetryProperties retryProperties;
     private final Clock clock;
@@ -34,12 +38,14 @@ public class NotificationClaimService {
     public NotificationClaimService(
             NotificationRepository notifications,
             DeliveryAttemptRepository attempts,
+            PreferenceEvaluationService preferenceEvaluation,
             RetryPolicy retryPolicy,
             NotificationRetryProperties retryProperties,
             Clock clock
     ) {
         this.notifications = notifications;
         this.attempts = attempts;
+        this.preferenceEvaluation = preferenceEvaluation;
         this.retryPolicy = retryPolicy;
         this.retryProperties = retryProperties;
         this.clock = clock;
@@ -76,6 +82,39 @@ public class NotificationClaimService {
                 continue;
             }
 
+            PreferenceDecision decision = preferenceEvaluation.evaluate(
+                    new PreferenceKey(
+                            notification.getSourceApplication(),
+                            notification.getRecipientEmail()
+                    ),
+                    now
+            );
+
+            if (decision instanceof PreferenceDecision.Suppressed suppressed) {
+                notification.suppressBeforeProcessing(
+                        suppressed.reason(),
+                        PROCESS,
+                        now
+                );
+                continue;
+            }
+
+            if (decision instanceof PreferenceDecision.Deferred deferred) {
+                notification.deferBeforeProcessing(
+                        deferred.nextEligibleAt(),
+                        PROCESS,
+                        now
+                );
+                continue;
+            }
+
+            // Only an explicit allow decision may create a delivery attempt.
+            if (decision != PreferenceDecision.Allowed.INSTANCE) {
+                throw new IllegalStateException(
+                        "Unsupported preference decision"
+                );
+            }
+
             int attemptNumber = notification.markProcessing(
                     PROCESS,
                     now,
@@ -105,6 +144,7 @@ public class NotificationClaimService {
             ));
         }
 
+        // Flushes all managed changes, including suppression and deferral.
         attempts.flush();
 
         return List.copyOf(claims);

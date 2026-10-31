@@ -11,6 +11,10 @@ prove external inbox delivery or exactly-once delivery.
   the native-versus-container account distinction.
 - Use the development database `notification_platform`, never the test or
   production database. This guide does not provision MySQL accounts.
+- The development account needs the reviewed V5 `email_preference` table
+  privileges, using its actual native `@'localhost'` or Docker `@'%'`
+  identity. Review existing grants; do not recreate accounts or broaden
+  privileges simply to make the demo pass.
 - Keep Kubernetes disabled; no external SMTP account is required.
 - Use only synthetic data. Stop other application/worker instances.
 - Use dedicated, reviewed terminals without unrelated Spring/JVM overrides.
@@ -171,6 +175,44 @@ p009_api() {
       --connect-timeout 5 --max-time 20 --header @- "$@" \
       "http://127.0.0.1:8080${p009_path}" --write-out '\n'
 }
+```
+
+### Create or inspect the required preference
+
+Before submitting a notification, create an explicit opt-in:
+
+```bash
+p009_api /api/v1/email-preferences \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "recipientEmail": "recipient@example.invalid",
+    "settings": {
+      "emailEnabled": true,
+      "localeTag": "en-IN",
+      "quietHours": null
+    }
+  }'
+```
+
+Require HTTP 201. If the preference already exists and returns 409,
+inspect it without automatically overwriting settings:
+
+```bash
+p009_api /api/v1/email-preferences/lookup \
+  --header 'Content-Type: application/json' \
+  --data '{"recipientEmail":"recipient@example.invalid"}'
+```
+
+Proceed only after confirming the expected application, exact recipient,
+emailEnabled=true and absent/null quiet hours. Otherwise stop for a
+reviewed, version-checked preference update.
+
+See the [preferences guide](email-preferences.md) for ownership, version
+checks and claim-time behavior.
+
+Now generate the demo idempotency key and submit the notification.
+
+```bash
 P009_DEMO_KEY="p009-mailpit-$(date -u +%s)-$RANDOM"
 P009_DEMO_JSON=$(printf '{"idempotencyKey":"%s","recipientEmail":"recipient@example.invalid","subject":"P009 SMTP demo %s","body":"Local SMTP capture only."}' "$P009_DEMO_KEY" "$P009_DEMO_KEY")
 printf 'Demo idempotency key: %s\n' "$P009_DEMO_KEY"
@@ -189,6 +231,11 @@ After processing, require `SENT`, `retryCount: 0` and `failureCode: null`.
 A short `PENDING`/`PROCESSING` interval is normal; check again shortly.
 For `FAILED` or `RETRY_PENDING`, stop and investigate the safe failure code.
 Do not create replacement keys to bypass an uncertain delivery outcome.
+
+For `SUPPRESSED`, inspect `suppressionReason` and stop this run. Later
+opt-in does not resurrect that notification, and an identical submission
+returns the same terminal record. Do not manually change its status or
+use operator replay to bypass suppression.
 
 Find exactly one message with this request's unique subject in Mailpit.
 Repeat the identical submission:
@@ -219,6 +266,10 @@ Leave MySQL running for the standard test suite. Do not delete records,
 messages or volumes; `docker compose down -v` would remove persistent data.
 
 ## Local evidence — 25 October 2026
+
+This is historical P009 evidence. The combined P010 preference-to-live-SMTP
+demonstration has not yet been rerun; the updated procedure above does not
+itself establish a new successful capture.
 
 - Full `clean verify`: 248 tests, zero failures/errors/skips; JAR packaged.
 - User-reported demo: new POST `202` → persisted `SENT` → one Mailpit capture;

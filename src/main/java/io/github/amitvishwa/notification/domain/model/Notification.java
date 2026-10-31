@@ -124,6 +124,10 @@ public class Notification extends AuditableEntity {
     )
     private Instant processingExpiresAt;
 
+    @Enumerated(EnumType.STRING)
+    @Column(name = "suppression_reason", length = 64)
+    private SuppressionReason suppressionReason;
+
     @Column(name = "failure_code", length = MAX_FAILURE_CODE_LENGTH)
     private String failureCode;
 
@@ -357,6 +361,62 @@ public class Notification extends AuditableEntity {
                 && processingExpiresAt.isAfter(now);
     }
 
+    public void suppressBeforeProcessing(
+            SuppressionReason reason,
+            String process,
+            Instant now
+    ) {
+        requirePreferenceDecisionAllowed(now);
+        Objects.requireNonNull(reason, "reason must not be null");
+
+        updateAudit(process, now);
+
+        status = NotificationStatus.SUPPRESSED;
+        suppressionReason = reason;
+        failureCode = null;
+        providerMessageId = null;
+        processingExpiresAt = null;
+    }
+
+    public void deferBeforeProcessing(
+            Instant nextEligibleAt,
+            String process,
+            Instant now
+    ) {
+        requirePreferenceDecisionAllowed(now);
+        Objects.requireNonNull(
+                nextEligibleAt,
+                "nextEligibleAt must not be null"
+        );
+
+        if (!nextEligibleAt.isAfter(now)) {
+            throw new IllegalArgumentException(
+                    "nextEligibleAt must be after now"
+            );
+        }
+
+        updateAudit(process, now);
+        nextAttemptAt = nextEligibleAt;
+    }
+
+    private void requirePreferenceDecisionAllowed(Instant now) {
+        if (status != NotificationStatus.PENDING
+                && status != NotificationStatus.RETRY_PENDING) {
+            throw new IllegalStateException(
+                    "Preference decisions require "
+                            + "PENDING or RETRY_PENDING status"
+            );
+        }
+
+        Objects.requireNonNull(now, "now must not be null");
+
+        if (nextAttemptAt.isAfter(now)) {
+            throw new IllegalStateException(
+                    "Notification is not yet eligible"
+            );
+        }
+    }
+
     private void requireEligibleStatus() {
         if (status != NotificationStatus.PENDING
                 && status != NotificationStatus.RETRY_PENDING) {
@@ -515,6 +575,8 @@ public class Notification extends AuditableEntity {
     public Instant getProcessingExpiresAt() {
         return processingExpiresAt;
     }
+
+    public SuppressionReason getSuppressionReason() { return suppressionReason; }
 
     public String getFailureCode() {
         return failureCode;

@@ -123,14 +123,30 @@ public class OperatorReplaySafetyConfiguration {
                 .orElse(Map.of());
 
         boolean unapproved = overrides.entrySet().stream()
-                .anyMatch(entry ->
-                        !"hibernate.jdbc.time_zone".equals(entry.getKey())
-                                || !"UTC".equalsIgnoreCase(entry.getValue())
-                );
+                .anyMatch(entry -> !isApprovedJpaOverride(
+                        entry.getKey(),
+                        entry.getValue()
+                ));
 
         if (unapproved) {
             throw refused("Custom JPA overrides are not allowed");
         }
+    }
+
+    private static boolean isApprovedJpaOverride(
+            String property,
+            String value
+    ) {
+        return switch (property) {
+            case "hibernate.jdbc.time_zone" ->
+                    "UTC".equalsIgnoreCase(value);
+
+            case "hibernate.jdbc.log.errors",
+                 "hibernate.jdbc.log.warnings" ->
+                    "false".equalsIgnoreCase(value);
+
+            default -> false;
+        };
     }
 
     private static IllegalStateException refused(String reason) {

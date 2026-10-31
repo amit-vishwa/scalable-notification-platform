@@ -11,9 +11,13 @@ import io.github.amitvishwa.notification.domain.model.Notification;
 import io.github.amitvishwa.notification.domain.model.NotificationKey;
 import io.github.amitvishwa.notification.domain.model.NotificationReplay;
 import io.github.amitvishwa.notification.domain.model.NotificationStatus;
+import io.github.amitvishwa.notification.domain.preference.EmailPreference;
+import io.github.amitvishwa.notification.domain.preference.EmailPreferenceSettings;
+import io.github.amitvishwa.notification.domain.preference.PreferenceKey;
 import io.github.amitvishwa.notification.infrastructure.persistence.DeliveryAttemptRepository;
 import io.github.amitvishwa.notification.infrastructure.persistence.NotificationReplayStore;
 import io.github.amitvishwa.notification.infrastructure.persistence.NotificationRepository;
+import io.github.amitvishwa.notification.infrastructure.persistence.preference.EmailPreferenceRepository;
 import io.github.amitvishwa.notification.operator.replay.OperatorReplayRunner;
 import io.github.amitvishwa.notification.worker.NotificationWorkerScheduler;
 import jakarta.persistence.EntityManagerFactory;
@@ -70,10 +74,23 @@ import static org.mockito.Mockito.when;
                 "notification.retry.initial-delay=PT1M",
                 "notification.retry.max-delay=PT15M",
                 "notification.retry.processing-lease=PT5M",
-                "spring.datasource.url=jdbc:mysql://localhost:3306/"
+                "spring.datasource.url=jdbc:mysql://127.0.0.1:3306/"
                         + "notification_platform_test?serverTimezone=UTC",
                 "spring.datasource.username=notification_test",
-                "spring.flyway.clean-disabled=true"
+                "spring.datasource.password=${NOTIFICATION_TEST_DB_PASSWORD}",
+                "spring.flyway.enabled=true",
+                "spring.flyway.url=jdbc:mysql://127.0.0.1:3306/"
+                        + "notification_platform_test?serverTimezone=UTC",
+                "spring.flyway.user=notification_test",
+                "spring.flyway.password=${NOTIFICATION_TEST_DB_PASSWORD}",
+                "spring.flyway.schemas=notification_platform_test",
+                "spring.flyway.default-schema=notification_platform_test",
+                "spring.flyway.create-schemas=false",
+                "spring.flyway.locations=classpath:db/migration",
+                "spring.flyway.clean-disabled=true",
+                "spring.flyway.baseline-on-migrate=false",
+                "spring.flyway.out-of-order=false",
+                "spring.jpa.hibernate.ddl-auto=validate"
         }
 )
 @ActiveProfiles("test")
@@ -114,6 +131,9 @@ class NotificationReplayIntegrationTest {
     private PlatformTransactionManager transactionManager;
 
     @Autowired
+    private EmailPreferenceRepository preferenceRepository;
+
+    @Autowired
     private ApplicationContext applicationContext;
 
     @MockitoBean(enforceOverride = true)
@@ -143,6 +163,17 @@ class NotificationReplayIntegrationTest {
 
         sourceApplication = "replay-test-" + UUID.randomUUID();
         when(clock.instant()).thenReturn(NOW);
+
+        preferenceRepository.saveAndFlush(EmailPreference.create(
+                UUID.randomUUID(),
+                new PreferenceKey(
+                        sourceApplication,
+                        "recipient@example.com"
+                ),
+                new EmailPreferenceSettings(true, "en-IN", null),
+                PROCESS,
+                NOW
+        ));
 
         assertThat(AopUtils.isAopProxy(replayService)).isTrue();
         assertThat(AopUtils.isAopProxy(replayStore)).isTrue();
@@ -196,6 +227,11 @@ class NotificationReplayIntegrationTest {
 
             jdbc.update("""
                     DELETE FROM notification
+                    WHERE source_application = ?
+                    """, sourceApplication);
+
+            jdbc.update("""
+                    DELETE FROM email_preference
                     WHERE source_application = ?
                     """, sourceApplication);
         });
