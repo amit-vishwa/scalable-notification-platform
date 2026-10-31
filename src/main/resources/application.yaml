@@ -29,6 +29,10 @@ spring:
       shutdown:
         await-termination: true
         await-termination-period: 20s
+  jpa:
+    properties:
+      "[hibernate.jdbc.log.errors]": false
+      "[hibernate.jdbc.log.warnings]": false
 
 server:
   shutdown: graceful

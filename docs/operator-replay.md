@@ -11,6 +11,11 @@ provider, access-control, deployment, and operating requirements are met.
   non-web mode of the packaged application.
 - A successful replay requeues work; it does not send email. Another
   enabled worker may send it later.
+- From P010, replay does not bypass email preferences: the next eligible
+  claim reevaluates them. Missing or disabled preferences can suppress work;
+  quiet hours can defer it. `SUPPRESSED` is not `FAILED` and is not eligible
+  for a new replay. Later opt-in does not resurrect suppressed work. See the
+  [email preferences guide](email-preferences.md).
 - Restrict the host, JAR, configuration, database credentials, and audit
   access. Use a separately approved operator account for the intended schema.
 - The OS-derived Java `user.name` is audit attribution, not authentication.
@@ -60,6 +65,8 @@ uncertain, the operator is explicitly accepting possible duplication.
 
 Replace the UUID/source literals with the approved values and qualify
 table names with the independently verified database where appropriate.
+The notification query below reflects the P010/V5 schema; use
+release-matched queries when investigating an older database.
 
 ```sql
 SELECT
@@ -67,7 +74,7 @@ SELECT
     source_application, status, version,
     last_attempt_number, cycle_attempt_count, retry_count,
     next_attempt_at, last_attempt_at, processing_expires_at,
-    failure_code, created_by_process, updated_by_process,
+    failure_code, suppression_reason, created_by_process, updated_by_process,
     created_at_time, updated_at_time
 FROM notification
 WHERE notification_id =
@@ -142,9 +149,19 @@ not trimmed or case-normalized.
 | `spring.jpa.hibernate.ddl-auto` | `validate` |
 
 Actual web application contexts are rejected. Native JPA overrides are
-rejected except `hibernate.jdbc.time_zone=UTC`. Argument validation runs
-before ordinary application beans. API authentication is servlet-only;
-this non-web mode does not require an API key.
+allowed only for these property/value pairs:
+
+| Native JPA property | Approved value |
+| --- | --- |
+| `hibernate.jdbc.time_zone` | `UTC` |
+| `hibernate.jdbc.log.errors` | `false` |
+| `hibernate.jdbc.log.warnings` | `false` |
+
+All other native JPA overrides are refused. These settings disable
+Hibernate's raw JDBC error/warning logging; exceptions still propagate.
+Argument validation runs before ordinary application beans. API
+authentication is servlet-only; this non-web mode does not require an API
+key.
 
 The operator guard does NOT validate the target URL/schema/account grants.
 Use reviewed configuration and restricted credentials. External
@@ -369,9 +386,13 @@ On 17 October 2026, local P008 verification reported:
 
 These checks do not prove all historical datasets, production rollback,
 tamper-proof audit retention, provider delivery, or multi-worker throughput.
-The current provider remains a simulator. PR review and CI remain separate
-release gates.
+The historical P008 checks used the simulator. Selectable SMTP support was
+added in P009, but SMTP acceptance is not confirmed mailbox delivery. PR
+review and CI remain separate release gates.
 
-The separate upgrade database/account are intentionally retained for
-inspection. Removing them requires a separately approved exact-target
-cleanup; no destructive cleanup commands are part of this runbook.
+The separate upgrade database/account were retained for inspection at the
+17 October run. Do not assume they still exist after an operating-system
+reinstall or a move to Docker; verify the exact environment and account
+identity before using the historical rehearsal guide. If they remain,
+removing them requires a separately approved exact-target cleanup; no
+destructive cleanup commands are part of this runbook.

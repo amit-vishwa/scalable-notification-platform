@@ -3,8 +3,10 @@ package io.github.amitvishwa.notification.api.error;
 import io.github.amitvishwa.notification.api.security.AuthenticatedCaller;
 import io.github.amitvishwa.notification.application.exception.IdempotencyConflictException;
 import io.github.amitvishwa.notification.application.exception.NotificationNotFoundException;
+import io.github.amitvishwa.notification.application.exception.PreferenceException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
@@ -225,5 +227,58 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
         }
 
         return UUID.randomUUID().toString();
+    }
+
+    @ExceptionHandler(PreferenceException.class)
+    public ResponseEntity<Object> handlePreference(
+            PreferenceException exception,
+            WebRequest request
+    ) {
+        return switch (exception.getReason()) {
+            case NOT_FOUND -> applicationError(
+                    HttpStatus.NOT_FOUND,
+                    "PREFERENCE_NOT_FOUND",
+                    exception.getMessage(),
+                    request
+            );
+            case ALREADY_EXISTS -> applicationError(
+                    HttpStatus.CONFLICT,
+                    "PREFERENCE_ALREADY_EXISTS",
+                    exception.getMessage(),
+                    request
+            );
+            case VERSION_CONFLICT -> applicationError(
+                    HttpStatus.CONFLICT,
+                    "PREFERENCE_VERSION_CONFLICT",
+                    exception.getMessage(),
+                    request
+            );
+        };
+    }
+
+    @ExceptionHandler(InvalidPreferenceRequestException.class)
+    public ResponseEntity<Object> handleInvalidPreference(
+            InvalidPreferenceRequestException exception,
+            WebRequest request
+    ) {
+        return applicationError(
+                HttpStatus.BAD_REQUEST,
+                "INVALID_PREFERENCE_REQUEST",
+                exception.getMessage(),
+                request
+        );
+    }
+
+    @ExceptionHandler(OptimisticLockingFailureException.class)
+    public ResponseEntity<Object> handleConcurrentModification(
+            OptimisticLockingFailureException exception,
+            WebRequest request
+    ) {
+        return applicationError(
+                HttpStatus.CONFLICT,
+                "CONCURRENT_MODIFICATION",
+                "The resource has changed. Retrieve it before updating.",
+                request
+        );
     }
 }

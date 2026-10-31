@@ -14,6 +14,9 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.DefaultApplicationArguments;
+import org.springframework.boot.context.properties.bind.Bindable;
+import org.springframework.boot.context.properties.bind.Binder;
+import org.springframework.boot.test.context.ConfigDataApplicationContextInitializer;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.boot.test.context.runner.WebApplicationContextRunner;
 import org.springframework.context.ConfigurableApplicationContext;
@@ -26,6 +29,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -314,9 +318,10 @@ class OperatorReplaySafetyTest {
                             .hasSingleBean(ApiKeyAuthenticationFilter.class);
 
                     MockHttpServletRequest request =
-                            new MockHttpServletRequest();
-                    request.setMethod("POST");
-                    request.setServletPath("/api/v1/notifications");
+                            new MockHttpServletRequest(
+                                    "POST",
+                                    "/api/v1/notifications"
+                            );
 
                     MockHttpServletResponse response =
                             new MockHttpServletResponse();
@@ -346,6 +351,88 @@ class OperatorReplaySafetyTest {
                         "notification.security.api-keys.employee-service=short"
                 )
                 .run(context -> assertThat(context).hasFailed());
+    }
+
+    @Test
+    void shouldAcceptShippedOperatorConfigurationWithPrivateDatabaseLogging() {
+        shippedOperatorRunner().run(context -> {
+            assertThat(context)
+                    .hasNotFailed()
+                    .hasSingleBean(ManualReplayRequest.class)
+                    .doesNotHaveBean(ApiKeyAuthenticationFilter.class)
+                    .doesNotHaveBean(NotificationBatchProcessor.class)
+                    .doesNotHaveBean(OperatorReplayRunner.class);
+
+            Map<String, String> overrides = Binder.get(
+                            context.getEnvironment()
+                    )
+                    .bind(
+                            "spring.jpa.properties",
+                            Bindable.mapOf(String.class, String.class)
+                    )
+                    .orElse(Map.of());
+
+            assertEquals(
+                    "UTC",
+                    overrides.get("hibernate.jdbc.time_zone")
+            );
+            assertEquals(
+                    "false",
+                    overrides.get("hibernate.jdbc.log.errors")
+            );
+            assertEquals(
+                    "false",
+                    overrides.get("hibernate.jdbc.log.warnings")
+            );
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "spring.jpa.properties.hibernate.jdbc.log.errors=true",
+            "spring.jpa.properties.hibernate.jdbc.log.warnings=true",
+            "spring.jpa.properties[hibernate.jdbc.log.errors]=true",
+            "spring.jpa.properties[hibernate.jdbc.log.warnings]=true",
+            "spring.jpa.properties.hibernate.jdbc.log.errors=",
+            "spring.jpa.properties.hibernate.jdbc.log.warnings=",
+            "spring.jpa.properties.hibernate.jdbc.time_zone=Europe/Paris",
+            "spring.jpa.properties.hibernate.hbm2ddl.auto=create"
+    })
+    void shouldRejectUnsafeOverridesWithShippedOperatorConfiguration(
+            String setting
+    ) {
+        AtomicBoolean ordinaryBeanCreated = new AtomicBoolean();
+
+        shippedOperatorRunner()
+                .withPropertyValues(setting)
+                .withBean("ordinaryBean", Object.class, () -> {
+                    ordinaryBeanCreated.set(true);
+                    return new Object();
+                })
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    assertThat(context.getStartupFailure())
+                            .hasStackTraceContaining(
+                                    "Custom JPA overrides are not allowed"
+                            );
+                    assertFalse(ordinaryBeanCreated.get());
+                });
+    }
+
+    private ApplicationContextRunner shippedOperatorRunner() {
+        return new ApplicationContextRunner()
+                .withInitializer(context -> {
+                    initialize(context, true, validArguments());
+
+                    new ConfigDataApplicationContextInitializer()
+                            .initialize(context);
+                })
+                .withUserConfiguration(
+                        OperatorReplaySafetyConfiguration.class,
+                        NotificationWorkerConfiguration.class,
+                        ApiSecurityConfiguration.class,
+                        ApiKeyAuthenticationFilter.class
+                );
     }
 
     private ApplicationContextRunner runner(

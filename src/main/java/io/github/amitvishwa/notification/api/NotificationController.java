@@ -106,6 +106,7 @@ public class NotificationController {
                         result.nextAttemptAt(),
                         result.lastAttemptAt(),
                         result.failureCode(),
+                        result.suppressionReason(),
                         result.createdAtTime(),
                         result.updatedAtTime()
                 );

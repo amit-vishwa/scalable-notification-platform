@@ -1,8 +1,13 @@
 # P008 populated-schema upgrade rehearsal
 
 A deliberately opt-in, one-shot check of historical V2 data surviving
-the original V3/V4 migrations. It uses the existing native local MySQL
-server; no Docker or additional paid tooling is needed.
+the original V3/V4 migrations. The original verification used native local
+MySQL; Docker is not required for the documented native procedure, and no
+additional paid tooling is needed.
+
+This historical rehearsal targets V2 to V4 only. It does not apply or
+validate P010's V5 email-preference migration, and it does not provision
+the current Docker environment.
 
 ## Scope and evidence
 
@@ -14,8 +19,11 @@ Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
 BUILD SUCCESS
 ```
 
-The rehearsal database/account were retained. Do not rerun setup or this
-test against that already populated database.
+The rehearsal database/account were retained at the 17 October run. Do not
+assume they still exist after an operating-system reinstall or a move to
+Docker; verify the exact environment and account identity before using
+this guide. Do not rerun setup or this test against an already populated
+rehearsal database.
 
 Test class:
 

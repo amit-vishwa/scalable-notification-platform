@@ -42,6 +42,7 @@ public class NotificationQueryService {
                 notification.getNextAttemptAt(),
                 notification.getLastAttemptAt(),
                 notification.getFailureCode(),
+                notification.getSuppressionReason(),
                 notification.getCreatedAtTime(),
                 notification.getUpdatedAtTime()
         );

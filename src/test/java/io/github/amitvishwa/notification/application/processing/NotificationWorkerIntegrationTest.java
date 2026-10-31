@@ -3,13 +3,13 @@ package io.github.amitvishwa.notification.application.processing;
 import io.github.amitvishwa.notification.application.port.email.EmailMessage;
 import io.github.amitvishwa.notification.application.port.email.EmailProvider;
 import io.github.amitvishwa.notification.application.port.email.EmailProviderResult;
-import io.github.amitvishwa.notification.domain.model.DeliveryAttempt;
-import io.github.amitvishwa.notification.domain.model.DeliveryAttemptOutcome;
-import io.github.amitvishwa.notification.domain.model.Notification;
-import io.github.amitvishwa.notification.domain.model.NotificationKey;
-import io.github.amitvishwa.notification.domain.model.NotificationStatus;
+import io.github.amitvishwa.notification.domain.model.*;
+import io.github.amitvishwa.notification.domain.preference.EmailPreference;
+import io.github.amitvishwa.notification.domain.preference.EmailPreferenceSettings;
+import io.github.amitvishwa.notification.domain.preference.PreferenceKey;
 import io.github.amitvishwa.notification.infrastructure.persistence.DeliveryAttemptRepository;
 import io.github.amitvishwa.notification.infrastructure.persistence.NotificationRepository;
+import io.github.amitvishwa.notification.infrastructure.persistence.preference.EmailPreferenceRepository;
 import io.github.amitvishwa.notification.worker.NotificationWorkerScheduler;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -37,19 +37,13 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.verifyNoInteractions;
-import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.*;
 
 @SpringBootTest(properties = {
         "notification.retry.max-attempts=5",
@@ -58,10 +52,24 @@ import static org.mockito.Mockito.when;
         "notification.retry.processing-lease=PT5M",
         "notification.worker.enabled=true",
         "notification.worker.poll-enabled=false",
-        "spring.datasource.url=jdbc:mysql://localhost:3306/"
+        "notification.email.provider=SIMULATED",
+        "spring.datasource.url=jdbc:mysql://127.0.0.1:3306/"
                 + "notification_platform_test?serverTimezone=UTC",
         "spring.datasource.username=notification_test",
-        "spring.flyway.clean-disabled=true"
+        "spring.datasource.password=${NOTIFICATION_TEST_DB_PASSWORD}",
+        "spring.flyway.enabled=true",
+        "spring.flyway.url=jdbc:mysql://127.0.0.1:3306/"
+                + "notification_platform_test?serverTimezone=UTC",
+        "spring.flyway.user=notification_test",
+        "spring.flyway.password=${NOTIFICATION_TEST_DB_PASSWORD}",
+        "spring.flyway.schemas=notification_platform_test",
+        "spring.flyway.default-schema=notification_platform_test",
+        "spring.flyway.create-schemas=false",
+        "spring.flyway.locations=classpath:db/migration",
+        "spring.flyway.clean-disabled=true",
+        "spring.flyway.baseline-on-migrate=false",
+        "spring.flyway.out-of-order=false",
+        "spring.jpa.hibernate.ddl-auto=validate"
 })
 @ActiveProfiles("test")
 @Isolated("Tests exercise the entire dedicated test queue")
@@ -88,6 +96,9 @@ class NotificationWorkerIntegrationTest {
 
     @Autowired
     private NotificationRepository notificationRepository;
+
+    @Autowired
+    private EmailPreferenceRepository preferenceRepository;
 
     @Autowired
     private DeliveryAttemptRepository deliveryAttemptRepository;
@@ -134,6 +145,17 @@ class NotificationWorkerIntegrationTest {
 
         when(clock.instant()).thenReturn(NOW);
 
+        preferenceRepository.saveAndFlush(EmailPreference.create(
+                UUID.randomUUID(),
+                new PreferenceKey(
+                        sourceApplication,
+                        "recipient@example.com"
+                ),
+                new EmailPreferenceSettings(true, "en-IN", null),
+                TEST_PROCESS,
+                NOW
+        ));
+
         assertThat(applicationContext.getBeansOfType(
                 NotificationWorkerScheduler.class
         )).isEmpty();
@@ -178,6 +200,11 @@ class NotificationWorkerIntegrationTest {
 
             jdbcTemplate.update("""
                     DELETE FROM notification
+                    WHERE source_application = ?
+                    """, sourceApplication);
+
+            jdbcTemplate.update("""
+                    DELETE FROM email_preference
                     WHERE source_application = ?
                     """, sourceApplication);
         });

@@ -1,8 +1,14 @@
 package io.github.amitvishwa.notification.api;
 
+import io.github.amitvishwa.notification.domain.model.SuppressionReason;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.Execution;
+import org.junit.jupiter.api.parallel.ExecutionMode;
+import org.junit.jupiter.api.parallel.Isolated;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
@@ -15,6 +21,8 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -25,11 +33,31 @@ import static org.assertj.core.api.Assertions.assertThat;
 @SpringBootTest(
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
         properties = {
+                "server.address=127.0.0.1",
                 "notification.worker.enabled=false",
-                "notification.worker.poll-enabled=false"
+                "notification.worker.poll-enabled=false",
+                "spring.datasource.url=jdbc:mysql://127.0.0.1:3306/"
+                        + "notification_platform_test?serverTimezone=UTC",
+                "spring.datasource.username=notification_test",
+                "spring.datasource.password=${NOTIFICATION_TEST_DB_PASSWORD}",
+                "spring.flyway.enabled=true",
+                "spring.flyway.url=jdbc:mysql://127.0.0.1:3306/"
+                        + "notification_platform_test?serverTimezone=UTC",
+                "spring.flyway.user=notification_test",
+                "spring.flyway.password=${NOTIFICATION_TEST_DB_PASSWORD}",
+                "spring.flyway.schemas=notification_platform_test",
+                "spring.flyway.default-schema=notification_platform_test",
+                "spring.flyway.create-schemas=false",
+                "spring.flyway.locations=classpath:db/migration",
+                "spring.flyway.clean-disabled=true",
+                "spring.flyway.baseline-on-migrate=false",
+                "spring.flyway.out-of-order=false",
+                "spring.jpa.hibernate.ddl-auto=validate"
         }
 )
 @ActiveProfiles("test")
+@Execution(ExecutionMode.SAME_THREAD)
+@Isolated("Uses the dedicated MySQL test schema")
 class NotificationApiIntegrationTest {
 
     private static final String ENDPOINT = "/api/v1/notifications";
@@ -37,6 +65,7 @@ class NotificationApiIntegrationTest {
     // Dummy credentials from application-test.yaml, not real secrets.
     private static final String EMPLOYEE_KEY =
             "test-only-employee-key-00000000000001";
+
     private static final String BILLING_KEY =
             "test-only-billing-key-000000000000002";
 
@@ -53,15 +82,37 @@ class NotificationApiIntegrationTest {
     @Autowired
     private JdbcTemplate jdbcTemplate;
 
+    private final List<CompletableFuture<HttpResponse<String>>> requests =
+            new ArrayList<>();
+
     private String keyPrefix;
 
     @BeforeEach
     void prepareTestNamespace() {
+        assertTestDatabase();
+
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT SUBSTRING_INDEX(CURRENT_USER(), '@', 1)",
+                String.class
+        )).isEqualTo("notification_test");
+
         keyPrefix = "api-test-" + UUID.randomUUID() + "-";
     }
 
     @AfterEach
-    void removeOnlyThisTestsNotifications() {
+    void removeOnlyThisTestsNotifications() throws Exception {
+        if (keyPrefix == null) {
+            return;
+        }
+
+        CompletableFuture<?>[] pending =
+                requests.toArray(new CompletableFuture<?>[0]);
+
+        // Retain fixtures if requests have not completed normally.
+        CompletableFuture.allOf(pending).get(30, TimeUnit.SECONDS);
+
+        assertTestDatabase();
+
         jdbcTemplate.update("""
                 DELETE FROM notification
                 WHERE source_application IN (?, ?)
@@ -71,6 +122,8 @@ class NotificationApiIntegrationTest {
                 "billing-service",
                 keyPrefix + "%"
         );
+
+        assertThat(storedCount()).isZero();
     }
 
     @Test
@@ -120,6 +173,7 @@ class NotificationApiIntegrationTest {
     @Test
     void rejectsClientSuppliedSourceApplication() throws Exception {
         String body = payload(keyPrefix + "spoofed-owner", "Hello");
+
         body = body.substring(0, body.lastIndexOf('}'))
                 + ", \"sourceApplication\": \"billing-service\"}";
 
@@ -166,10 +220,72 @@ class NotificationApiIntegrationTest {
         assertThat(result.get("status")).isEqualTo("PENDING");
         assertThat(result.get("maskedRecipient"))
                 .isEqualTo("***@example.com");
+
         assertThat(result.containsKey("body")).isFalse();
         assertThat(result.containsKey("recipientEmail")).isFalse();
         assertThat(result.containsKey("providerMessageId")).isFalse();
         assertThat(result.containsKey("createdByProcess")).isFalse();
+    }
+
+    @ParameterizedTest
+    @EnumSource(SuppressionReason.class)
+    void exposesSuppressionReasonWithoutTreatingItAsDeliveryFailure(
+            SuppressionReason reason
+    ) throws Exception {
+        String key = keyPrefix + "suppressed";
+
+        HttpResponse<String> submitted = post(
+                EMPLOYEE_KEY,
+                payload(key, "Synthetic suppressed notification")
+        );
+
+        assertThat(submitted.statusCode()).isEqualTo(202);
+
+        String id = notificationId(submitted);
+
+        // Controlled status-view fixture. Actual worker transitions are
+        // covered by PreferenceWorkerIntegrationTest.
+        int changed = jdbcTemplate.update("""
+                UPDATE notification
+                SET status = 'SUPPRESSED',
+                    suppression_reason = ?,
+                    failure_code = NULL,
+                    provider_message_id = NULL,
+                    processing_expires_at = NULL,
+                    version = version + 1,
+                    updated_by_process = ?,
+                    updated_at_time = UTC_TIMESTAMP(6)
+                WHERE source_application = ?
+                  AND idempotency_key = ?
+                  AND notification_id = UNHEX(REPLACE(?, '-', ''))
+                """,
+                reason.name(),
+                "status-view-fixture",
+                "employee-service",
+                key,
+                id
+        );
+
+        assertThat(changed).isEqualTo(1);
+
+        HttpResponse<String> response = get(EMPLOYEE_KEY, id);
+        Map<?, ?> result = json(response);
+
+        assertThat(response.statusCode()).isEqualTo(200);
+        assertThat(result.get("status")).isEqualTo("SUPPRESSED");
+        assertThat(result.get("suppressionReason"))
+                .isEqualTo(reason.name());
+        assertThat(result.containsKey("failureCode")).isTrue();
+        assertThat(result.get("failureCode")).isNull();
+        assertThat(result.get("maskedRecipient"))
+                .isEqualTo("***@example.com");
+
+        assertThat(result.containsKey("body")).isFalse();
+        assertThat(result.containsKey("recipientEmail")).isFalse();
+        assertThat(result.containsKey("providerMessageId")).isFalse();
+        assertThat(response.body()).doesNotContain("recipient@example.com");
+        assertThat(response.headers().firstValue("Cache-Control"))
+                .contains("no-store");
     }
 
     @Test
@@ -192,6 +308,7 @@ class NotificationApiIntegrationTest {
 
         HttpResponse<String> original =
                 post(EMPLOYEE_KEY, payload(key, "Original body"));
+
         HttpResponse<String> conflict =
                 post(EMPLOYEE_KEY, payload(key, "Changed body"));
 
@@ -262,6 +379,7 @@ class NotificationApiIntegrationTest {
                 EMPLOYEE_KEY,
                 payload(keyPrefix + "Case", "Hello")
         );
+
         HttpResponse<String> lower = post(
                 EMPLOYEE_KEY,
                 payload(keyPrefix + "case", "Hello")
@@ -278,17 +396,13 @@ class NotificationApiIntegrationTest {
     void concurrentIdenticalRequestsProduceOneNotification() throws Exception {
         String body = payload(keyPrefix + "concurrent", "Hello");
 
-        CompletableFuture<HttpResponse<String>> first = CLIENT.sendAsync(
-                postRequest(EMPLOYEE_KEY, body),
-                HttpResponse.BodyHandlers.ofString()
-        );
-        CompletableFuture<HttpResponse<String>> second = CLIENT.sendAsync(
-                postRequest(EMPLOYEE_KEY, body),
-                HttpResponse.BodyHandlers.ofString()
-        );
+        CompletableFuture<HttpResponse<String>> first =
+                start(postRequest(EMPLOYEE_KEY, body));
 
-        CompletableFuture.allOf(first, second)
-                .get(30, TimeUnit.SECONDS);
+        CompletableFuture<HttpResponse<String>> second =
+                start(postRequest(EMPLOYEE_KEY, body));
+
+        CompletableFuture.allOf(first, second).get(30, TimeUnit.SECONDS);
 
         HttpResponse<String> firstResponse = first.join();
         HttpResponse<String> secondResponse = second.join();
@@ -325,12 +439,26 @@ class NotificationApiIntegrationTest {
         return builder.build();
     }
 
-    private HttpResponse<String> post(String apiKey, String body)
-            throws Exception {
-        return CLIENT.send(
-                postRequest(apiKey, body),
+    private CompletableFuture<HttpResponse<String>> start(
+            HttpRequest request
+    ) {
+        CompletableFuture<HttpResponse<String>> future = CLIENT.sendAsync(
+                request,
                 HttpResponse.BodyHandlers.ofString()
         );
+
+        requests.add(future);
+        return future;
+    }
+
+    private HttpResponse<String> send(HttpRequest request)
+            throws Exception {
+        return start(request).get(30, TimeUnit.SECONDS);
+    }
+
+    private HttpResponse<String> post(String apiKey, String body)
+            throws Exception {
+        return send(postRequest(apiKey, body));
     }
 
     private HttpResponse<String> get(String apiKey, String id)
@@ -343,11 +471,11 @@ class NotificationApiIntegrationTest {
                 .GET()
                 .build();
 
-        return CLIENT.send(request, HttpResponse.BodyHandlers.ofString());
+        return send(request);
     }
 
     private URI uri(String path) {
-        return URI.create("http://localhost:" + port + path);
+        return URI.create("http://127.0.0.1:" + port + path);
     }
 
     private Map<?, ?> json(HttpResponse<String> response) {
@@ -356,6 +484,7 @@ class NotificationApiIntegrationTest {
 
     private String notificationId(HttpResponse<String> response) {
         Object id = json(response).get("notificationId");
+
         assertThat(id).isNotNull();
         return id.toString();
     }
@@ -372,6 +501,14 @@ class NotificationApiIntegrationTest {
                 keyPrefix + "%"
         );
 
-        return count == null ? 0L : count;
+        assertThat(count).isNotNull();
+        return count;
+    }
+
+    private void assertTestDatabase() {
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT DATABASE()",
+                String.class
+        )).isEqualTo("notification_platform_test");
     }
 }
